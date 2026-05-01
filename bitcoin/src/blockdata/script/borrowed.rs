@@ -2,7 +2,6 @@
 
 use core::fmt;
 
-use hex::DisplayHex as _;
 use internals::array::ArrayExt; // For `split_first`.
 use internals::ToU64 as _;
 
@@ -12,14 +11,14 @@ use super::{
     RedeemScriptSizeError, Script, ScriptHash, ScriptHashableTag, ScriptPubKey, ScriptSig,
     TapScript, WScriptHash, WitnessScript, WitnessScriptSizeError,
 };
-use crate::consensus::{self, Encodable};
-use crate::key::{PublicKey, UntweakedPublicKey, WPubkeyHash};
+use crate::consensus::Encodable;
+use crate::key::{LegacyPublicKey, UntweakedPublicKey, WPubkeyHash};
 use crate::opcodes::all::*;
 use crate::opcodes::{self, Opcode};
 use crate::policy::{DUST_RELAY_TX_FEE, MAX_OP_RETURN_RELAY};
 use crate::prelude::{sink, String, ToString};
 use crate::script::{self, ScriptPubKeyBufExt as _};
-use crate::taproot::{LeafVersion, TapLeafHash, TapNodeHash};
+use crate::taproot::{LeafVersion, TapLeafHash, TapLeafHashExt as _, TapNodeHash};
 use crate::witness_program::P2A_PROGRAM;
 use crate::{internal_macros, Amount, FeeRate, ScriptPubKeyBuf, WitnessScriptBuf};
 
@@ -137,20 +136,6 @@ internal_macros::define_extension_trait! {
         /// Consensus encodes the script as lower-case hex.
         #[deprecated(since = "TBD", note = "use `to_hex_string_no_length_prefix` instead")]
         fn to_hex_string(&self) -> String { self.to_hex_string_no_length_prefix() }
-
-        /// Consensus encodes the script as lower-case hex.
-        ///
-        /// Consensus encoding includes a length prefix. To hex encode without the length prefix use
-        /// `to_hex_string_no_length_prefix`.
-        fn to_hex_string_prefixed(&self) -> String { consensus::encode::serialize_hex(self) }
-
-        /// Encodes the script as lower-case hex.
-        ///
-        /// This is **not** consensus encoding. The returned hex string will not include the length
-        /// prefix. See `to_hex_string_prefixed`.
-        fn to_hex_string_no_length_prefix(&self) -> String {
-            self.as_bytes().to_lower_hex_string()
-        }
 
         /// Returns the first opcode of the script (if there is any).
         fn first_opcode(&self) -> Option<Opcode> {
@@ -305,8 +290,8 @@ internal_macros::define_extension_trait! {
         /// This may return `None` even when [`is_p2pk()`](Self::is_p2pk) returns true.
         /// This happens when the public key is invalid (e.g. the point not being on the curve).
         /// In this situation the script is unspendable.
-        fn p2pk_public_key(&self) -> Option<PublicKey> {
-            PublicKey::from_slice(self.p2pk_pubkey_bytes()?).ok()
+        fn p2pk_public_key(&self) -> Option<LegacyPublicKey> {
+            LegacyPublicKey::from_slice(self.p2pk_pubkey_bytes()?).ok()
         }
 
         /// Checks whether a script pubkey is a P2SH output.

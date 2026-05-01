@@ -21,6 +21,8 @@ use crate::script::{Script, ScriptHashableTag, MAX_REDEEM_SCRIPT_SIZE};
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScriptHash(hash160::Hash);
 
+super::impl_debug!(ScriptHash);
+
 impl ScriptHash {
     /// Constructs a new `ScriptHash` after first checking the script size.
     ///
@@ -86,7 +88,9 @@ impl fmt::Display for RedeemScriptSizeError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for RedeemScriptSizeError {}
+impl std::error::Error for RedeemScriptSizeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 // The new hash wrapper type.
 type HashType = ScriptHash;

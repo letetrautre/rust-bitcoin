@@ -7,9 +7,6 @@
 //! module describes structures and functions needed to describe
 //! these blocks and the blockchain.
 
-use core::convert::Infallible;
-use core::fmt;
-
 use encoding::CompactSizeEncoder;
 use internals::ToU64;
 use io::{BufRead, Write};
@@ -17,21 +14,31 @@ use io::{BufRead, Write};
 use crate::consensus::encode::{self, Decodable, Encodable, WriteExt as _};
 use crate::merkle_tree::{TxMerkleNode, WitnessMerkleNode};
 use crate::network::Params;
+use crate::pow::TargetExt as _;
 use crate::prelude::Vec;
-use crate::script::{self, ScriptExt as _, ScriptIntError};
+use crate::script::ScriptExt as _;
 use crate::transaction::{Coinbase, Transaction, TransactionExt as _};
 use crate::{internal_macros, BlockTime, Target, Weight, Work};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
 pub use primitives::block::{
-    Block, Checked, Unchecked, Validation, Version, BlockHash, Header,
-    WitnessCommitment, compute_merkle_root, compute_witness_root, InvalidBlockError, ParseHeaderError,
+    Block, BlockDecoder, BlockEncoder, BlockHash, BlockHashDecoder, BlockHashEncoder,
+    Checked, Unchecked, Validation, Version, VersionDecoder, VersionEncoder, Header,
+    HeaderDecoder, HeaderEncoder, WitnessCommitment, compute_merkle_root, compute_witness_root,
 };
-#[doc(no_inline)]
-pub use units::block::TooBigForRelativeHeightError;
 #[doc(inline)]
-pub use units::block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval};
+pub use units::block::{
+    BlockHeight, BlockHeightDecoder, BlockHeightEncoder, BlockHeightInterval, BlockMtp,
+    BlockMtpInterval,
+};
+
+#[doc(no_inline)]
+pub use self::error::{
+    Bip34Error, BlockDecoderError, BlockHashDecoderError, BlockHeightDecoderError,
+    HeaderDecoderError, InvalidBlockError, ParseBlockError, ParseHeaderError,
+    TooBigForRelativeHeightError, ValidationError, VersionDecoderError,
+};
 
 #[deprecated(since = "TBD", note = "use `BlockHeightInterval` instead")]
 #[doc(hidden)]
@@ -214,7 +221,7 @@ impl BlockCheckedExt for Block<Checked> {
             .instructions_minimal()
             .next()
             .ok_or(Bip34Error::NotPresent)?
-            .map_err(to_bip34_error)?;
+            .map_err(error::to_bip34_error)?;
         match (push.script_num(), push.push_bytes().map(|b| b.read_scriptint())) {
             (Some(num), Some(Ok(_)) | None) =>
                 Ok(num.try_into().map_err(|_| Bip34Error::NegativeHeight)?),
@@ -291,107 +298,127 @@ mod sealed {
     impl<V: super::Validation> Sealed for super::Block<V> {}
 }
 
-/// An error when looking up a BIP-0034 block height.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Bip34Error {
-    /// The block does not support BIP-0034 yet.
-    Unsupported,
-    /// No push was present where the BIP-0034 push was expected.
-    NotPresent,
-    /// The BIP-0034 push was not minimally encoded.
-    NonMinimalPush,
-    /// The BIP-0034 push was negative.
-    NegativeHeight,
-}
+/// Error types for Bitcoin blocks.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl From<Infallible> for Bip34Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    use crate::script::{Error, ScriptIntError};
 
-impl fmt::Display for Bip34Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Unsupported => write!(f, "block doesn't support BIP-0034"),
-            Self::NotPresent => write!(f, "BIP-0034 push not present in block's coinbase"),
-            Self::NonMinimalPush => write!(f, "byte push not minimally encoded"),
-            Self::NegativeHeight => write!(f, "negative BIP-0034 height"),
+    #[rustfmt::skip]
+    #[doc(no_inline)]
+    pub use primitives::block::{
+        BlockDecoderError, BlockHashDecoderError, HeaderDecoderError, InvalidBlockError,
+        ParseBlockError, ParseHeaderError, VersionDecoderError,
+    };
+    #[doc(no_inline)]
+    pub use units::block::{BlockHeightDecoderError, TooBigForRelativeHeightError};
+
+    /// An error when looking up a BIP-0034 block height.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Bip34Error {
+        /// The block does not support BIP-0034 yet.
+        Unsupported,
+        /// No push was present where the BIP-0034 push was expected.
+        NotPresent,
+        /// The BIP-0034 push was not minimally encoded.
+        NonMinimalPush,
+        /// The BIP-0034 push was negative.
+        NegativeHeight,
+    }
+
+    impl From<Infallible> for Bip34Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for Bip34Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::Unsupported => write!(f, "block doesn't support BIP-0034"),
+                Self::NotPresent => write!(f, "BIP-0034 push not present in block's coinbase"),
+                Self::NonMinimalPush => write!(f, "byte push not minimally encoded"),
+                Self::NegativeHeight => write!(f, "negative BIP-0034 height"),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for Bip34Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Unsupported | Self::NotPresent | Self::NonMinimalPush | Self::NegativeHeight =>
-                None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for Bip34Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Unsupported
+                | Self::NotPresent
+                | Self::NonMinimalPush
+                | Self::NegativeHeight => None,
+            }
         }
     }
-}
 
-impl From<ScriptIntError> for Bip34Error {
+    impl From<ScriptIntError> for Bip34Error {
+        #[inline]
+        fn from(err: ScriptIntError) -> Self {
+            match err {
+                ScriptIntError::NonMinimal => Self::NonMinimalPush,
+                _ => Self::NotPresent,
+            }
+        }
+    }
+
     #[inline]
-    fn from(err: ScriptIntError) -> Self {
+    pub(super) fn to_bip34_error(err: Error) -> Bip34Error {
         match err {
-            ScriptIntError::NonMinimal => Self::NonMinimalPush,
-            _ => Self::NotPresent,
+            Error::NonMinimalPush => Bip34Error::NonMinimalPush,
+            _ => Bip34Error::NotPresent,
         }
     }
-}
 
-#[inline]
-fn to_bip34_error(err: script::Error) -> Bip34Error {
-    match err {
-        script::Error::NonMinimalPush => Bip34Error::NonMinimalPush,
-        _ => Bip34Error::NotPresent,
+    /// A block validation error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum ValidationError {
+        /// The header hash is not below the target.
+        BadProofOfWork,
+        /// The `target` field of a block header did not match the expected difficulty.
+        BadTarget,
     }
-}
 
-/// A block validation error.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ValidationError {
-    /// The header hash is not below the target.
-    BadProofOfWork,
-    /// The `target` field of a block header did not match the expected difficulty.
-    BadTarget,
-}
+    impl From<Infallible> for ValidationError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
 
-impl From<Infallible> for ValidationError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::BadProofOfWork => f.write_str("block target correct but not attained"),
-            Self::BadTarget => f.write_str("block target incorrect"),
+    impl fmt::Display for ValidationError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::BadProofOfWork => f.write_str("block target correct but not attained"),
+                Self::BadTarget => f.write_str("block target incorrect"),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for ValidationError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::BadProofOfWork | Self::BadTarget => None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for ValidationError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::BadProofOfWork | Self::BadTarget => None,
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use hex_lit::hex;
+    use alloc::string::ToString;
+
+    use hex_unstable::hex;
     use internals::ToU64 as _;
-    use primitives::Wtxid;
 
     use super::*;
     use crate::consensus::encode::{deserialize, serialize};
     use crate::pow::test_utils::{u128_to_work, u64_to_work};
     use crate::script::{ScriptPubKeyBuf, ScriptSigBuf};
     use crate::transaction::{OutPoint, Transaction, TxIn, TxOut, Txid};
-    use crate::{block, Amount, CompactTarget, Network, Sequence, TestnetVersion, Witness};
+    use crate::{block, Amount, CompactTarget, Network, Sequence, TestnetVersion, Witness, Wtxid};
 
     #[test]
     fn static_vector() {

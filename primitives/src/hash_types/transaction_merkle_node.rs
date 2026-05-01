@@ -19,6 +19,8 @@ use crate::Txid;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TxMerkleNode(sha256d::Hash);
 
+super::impl_debug!(TxMerkleNode);
+
 // The new hash wrapper type.
 type HashType = TxMerkleNode;
 // The inner hash type from `hashes`.
@@ -48,52 +50,40 @@ impl TxMerkleNode {
     }
 }
 
+impl encoding::Encode for TxMerkleNode {
+    type Encoder<'e> = TxMerkleNodeEncoder<'e>;
+    #[inline]
+    fn encoder(&self) -> Self::Encoder<'_> {
+        TxMerkleNodeEncoder::new(encoding::ArrayRefEncoder::without_length_prefix(
+            self.as_byte_array(),
+        ))
+    }
+}
+
+impl encoding::Decode for TxMerkleNode {
+    type Decoder = TxMerkleNodeDecoder;
+    #[inline]
+    fn decoder() -> Self::Decoder { TxMerkleNodeDecoder(encoding::ArrayDecoder::<32>::new()) }
+}
+
 encoding::encoder_newtype_exact! {
     /// The encoder for the [`TxMerkleNode`] type.
-    pub struct TxMerkleNodeEncoder<'e>(encoding::ArrayEncoder<32>);
+    #[derive(Debug, Clone)]
+    pub struct TxMerkleNodeEncoder<'e>(encoding::ArrayRefEncoder<'e, 32>);
 }
 
-impl encoding::Encodable for TxMerkleNode {
-    type Encoder<'e> = TxMerkleNodeEncoder<'e>;
-    fn encoder(&self) -> Self::Encoder<'_> {
-        TxMerkleNodeEncoder::new(encoding::ArrayEncoder::without_length_prefix(self.to_byte_array()))
-    }
-}
+crate::decoder_newtype! {
+    /// The decoder for the [`TxMerkleNode`] type.
+    #[derive(Debug, Clone)]
+    pub struct TxMerkleNodeDecoder(encoding::ArrayDecoder<32>);
 
-/// The decoder for the [`TxMerkleNode`] type.
-pub struct TxMerkleNodeDecoder(encoding::ArrayDecoder<32>);
-
-impl TxMerkleNodeDecoder {
     /// Constructs a new [`TxMerkleNode`] decoder.
     pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
-}
 
-impl Default for TxMerkleNodeDecoder {
-    fn default() -> Self { Self::new() }
-}
-
-impl encoding::Decoder for TxMerkleNodeDecoder {
-    type Output = TxMerkleNode;
-    type Error = TxMerkleNodeDecoderError;
-
-    #[inline]
-    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        self.0.push_bytes(bytes).map_err(TxMerkleNodeDecoderError)
+    fn end(result: Result<[u8; 32], encoding::UnexpectedEofError>) -> Result<TxMerkleNode, TxMerkleNodeDecoderError> {
+        let bytes = result.map_err(TxMerkleNodeDecoderError)?;
+        Ok(TxMerkleNode::from_byte_array(bytes))
     }
-
-    #[inline]
-    fn end(self) -> Result<Self::Output, Self::Error> {
-        let a = self.0.end().map_err(TxMerkleNodeDecoderError)?;
-        Ok(TxMerkleNode::from_byte_array(a))
-    }
-
-    #[inline]
-    fn read_limit(&self) -> usize { self.0.read_limit() }
-}
-
-impl encoding::Decodable for TxMerkleNode {
-    type Decoder = TxMerkleNodeDecoder;
-    fn decoder() -> Self::Decoder { TxMerkleNodeDecoder(encoding::ArrayDecoder::<32>::new()) }
 }
 
 /// An error consensus decoding an `TxMerkleNode`.
@@ -106,7 +96,7 @@ impl From<Infallible> for TxMerkleNodeDecoderError {
 
 impl fmt::Display for TxMerkleNodeDecoderError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "sequence decoder error"; self.0)
+        write_err!(f, "tx merkle node decoder error"; self.0)
     }
 }
 
@@ -124,7 +114,7 @@ mod tests {
     #[test]
     fn decoder_full_read_limit() {
         assert_eq!(TxMerkleNodeDecoder::default().read_limit(), 32);
-        assert_eq!(<TxMerkleNode as encoding::Decodable>::decoder().read_limit(), 32);
+        assert_eq!(<TxMerkleNode as encoding::Decode>::decoder().read_limit(), 32);
     }
 
     #[test]

@@ -10,9 +10,10 @@
 use crate::{ripemd160, sha256};
 
 crate::internal_macros::general_hash_type! {
-    160,
-    false,
-    "Output of the Bitcoin HASH160 hash function. (RIPEMD160(SHA256))"
+    /// Output of the Bitcoin HASH160 hash function. (RIPEMD160(SHA256))
+    pub struct Hash([u8; 20]);
+
+    const DISPLAY_BACKWARD: bool = false;
 }
 
 impl Hash {

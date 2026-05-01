@@ -38,12 +38,10 @@
 //!  ```
 
 use core::cmp::{self, Ordering};
-use core::convert::Infallible;
-use core::fmt;
 
 use hashes::{sha256d, siphash24};
 use internals::array::ArrayExt as _;
-use internals::{write_err, ToU64 as _};
+use internals::ToU64 as _;
 use io::{BufRead, Write};
 
 use crate::block::{Block, BlockHash, Checked};
@@ -52,46 +50,13 @@ use crate::prelude::{BTreeSet, Borrow, Vec};
 use crate::script::{ScriptPubKey, ScriptPubKeyExt as _};
 use crate::transaction::OutPoint;
 
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::Error;
+
 /// Golomb encoding parameter as in BIP-0158, see also https://gist.github.com/sipa/576d5f09c3b86c3b1b75598d799fc845
 const P: u8 = 19;
 const M: u64 = 784931;
-
-/// Errors for blockfilter.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Error {
-    /// Missing UTXO, cannot calculate script filter.
-    UtxoMissing(OutPoint),
-    /// I/O error reading or writing binary serialization of the filter.
-    Io(io::Error),
-}
-
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        match self {
-            Self::UtxoMissing(ref coin) => write!(f, "unresolved UTXO {}", coin),
-            Self::Io(ref e) => write_err!(f, "I/O error"; e),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UtxoMissing(_) => None,
-            Self::Io(ref e) => Some(e),
-        }
-    }
-}
-
-impl From<io::Error> for Error {
-    fn from(io: io::Error) -> Self { Self::Io(io) }
-}
 
 /// A block filter, as described by BIP 158.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,20 +496,72 @@ impl<'a, W: Write> BitStreamWriter<'a, W> {
     }
 }
 
+/// Error types for BIP-158
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    use crate::transaction::OutPoint;
+
+    /// Errors for blockfilter.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// Missing UTXO, cannot calculate script filter.
+        UtxoMissing(OutPoint),
+        /// I/O error reading or writing binary serialization of the filter.
+        Io(io::Error),
+    }
+
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::UtxoMissing(ref coin) => write!(f, "unresolved UTXO {}", coin),
+                Self::Io(ref e) => write_err!(f, "I/O error"; e),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::UtxoMissing(_) => None,
+                Self::Io(ref e) => Some(e),
+            }
+        }
+    }
+
+    impl From<io::Error> for Error {
+        fn from(io: io::Error) -> Self { Self::Io(io) }
+    }
+}
+
 #[cfg(test)]
 mod test {
+    #[cfg(feature = "std")]
     use std::collections::HashMap;
 
-    use hex_lit::hex;
+    use hex_unstable::hex;
+    #[cfg(feature = "std")]
     use serde_json::Value;
 
     use super::*;
+    #[cfg(feature = "std")]
     use crate::consensus::encode::deserialize;
+    #[cfg(feature = "std")]
     use crate::ScriptPubKeyBuf;
 
     #[test]
+    #[cfg(feature = "std")]
     fn blockfilters() {
-        let hex = |b| <Vec<u8> as hex::FromHex>::from_hex(b).unwrap();
+        let hex = |b| crate::hex::decode_to_vec(b).unwrap();
 
         // test vectors from: https://github.com/jimpo/bitcoin/blob/c7efb652f3543b001b4dd22186a354605b14f47e/src/test/data/blockfilters.json
         let data = include_str!("../tests/data/blockfilters.json");
@@ -586,7 +603,7 @@ mod test {
             assert!(filter
                 .match_all(
                     *block_hash,
-                    &mut txmap.iter().filter_map(|(_, s)| if !s.is_empty() {
+                    &mut txmap.values().filter_map(|s| if !s.is_empty() {
                         Some(s.as_bytes())
                     } else {
                         None
@@ -667,7 +684,8 @@ mod test {
             for p in &patterns {
                 query.push(p);
             }
-            query.push(&hex!("abcdef"));
+            let extra = hex!("abcdef");
+            query.push(&extra);
             assert!(!reader
                 .match_all(&mut bytes.as_slice(), &mut query.iter().map(|v| v.as_slice()))
                 .unwrap());

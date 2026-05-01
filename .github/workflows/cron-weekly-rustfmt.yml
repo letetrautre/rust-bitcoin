@@ -15,12 +15,9 @@ jobs:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@55d80eb3c5a4228eec5390a083c092095115c6f1 # nightly
-        with:
-          components: rustfmt
+      - uses: rust-bitcoin/rust-bitcoin-maintainer-tools/.github/actions/setup-rbmt@64715bab0d6fa1f3ebd6f9be336c4c5089bb5eb9
       - name: Run Nightly rustfmt
-        # Run the formatter and manually remove trailing whitespace.
-        run: cargo +nightly fmt && git ls-files -- '*.rs' -z | xargs sed -E -i'' -e 's/[[:space:]]+$//'
+        run: cargo rbmt fmt
       - name: Get the current date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
       - name: Create Pull Request

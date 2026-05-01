@@ -5,8 +5,6 @@
 //! This module describes BIP-0037 Connection Bloom filtering network messages.
 
 use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::fmt;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
@@ -15,10 +13,13 @@ use encoding::{
     ArrayDecoder, ArrayEncoder, ByteVecDecoder, BytesEncoder, CompactSizeEncoder, Decoder4,
     Encoder2, Encoder3,
 };
-use internals::write_err;
 use io::{BufRead, Write};
 
 use crate::consensus::impl_consensus_encoding;
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{BloomFlagsDecoderError, FilterAddDecoderError, FilterLoadDecoderError};
 
 /// `filterload` message sets the current bloom filter
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -33,8 +34,9 @@ pub struct FilterLoad {
     pub flags: BloomFlags,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`FilterLoad`] message.
+    #[derive(Debug, Clone)]
     pub struct FilterLoadEncoder<'e>(
         Encoder2<
             Encoder2<CompactSizeEncoder, BytesEncoder<'e>>,
@@ -47,7 +49,7 @@ encoding::encoder_newtype! {
     );
 }
 
-impl encoding::Encodable for FilterLoad {
+impl encoding::Encode for FilterLoad {
     type Encoder<'e> = FilterLoadEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -69,6 +71,7 @@ type FilterLoadInnerDecoder =
     Decoder4<ByteVecDecoder, ArrayDecoder<4>, ArrayDecoder<4>, BloomFlagsDecoder>;
 
 /// The decoder for the [`FilterLoad`] message.
+#[derive(Debug, Clone)]
 pub struct FilterLoadDecoder(FilterLoadInnerDecoder);
 
 impl encoding::Decoder for FilterLoadDecoder {
@@ -95,7 +98,7 @@ impl encoding::Decoder for FilterLoadDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for FilterLoad {
+impl encoding::Decode for FilterLoad {
     type Decoder = FilterLoadDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -106,25 +109,6 @@ impl encoding::Decodable for FilterLoad {
             BloomFlags::decoder(),
         ))
     }
-}
-
-/// An error occuring when decoding a [`FilterLoad`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterLoadDecoderError(<FilterLoadInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for FilterLoadDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for FilterLoadDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "filterload error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for FilterLoadDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(FilterLoad, filter, hash_funcs, tweak, flags);
@@ -140,28 +124,28 @@ pub enum BloomFlags {
     PubkeyOnly,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for [`BloomFlags`].
+    #[derive(Debug, Clone)]
     pub struct BloomFlagsEncoder<'e>(ArrayEncoder<1>);
 }
 
-impl encoding::Encodable for BloomFlags {
+impl encoding::Encode for BloomFlags {
     type Encoder<'e> = BloomFlagsEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
-        BloomFlagsEncoder::new(ArrayEncoder::without_length_prefix(
-         [match self {
-                Self::None => 0,
-                Self::All => 1,
-                Self::PubkeyOnly => 2,
-            }]
-        ))
+        BloomFlagsEncoder::new(ArrayEncoder::without_length_prefix([match self {
+            Self::None => 0,
+            Self::All => 1,
+            Self::PubkeyOnly => 2,
+        }]))
     }
 }
 
 type BloomFlagsInnerDecoder = ArrayDecoder<1>;
 
 /// The decoder for [`BloomFlags`].
+#[derive(Debug, Clone)]
 pub struct BloomFlagsDecoder(BloomFlagsInnerDecoder);
 
 impl BloomFlagsDecoder {
@@ -197,42 +181,10 @@ impl encoding::Decoder for BloomFlagsDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for BloomFlags {
+impl encoding::Decode for BloomFlags {
     type Decoder = BloomFlagsDecoder;
 
     fn decoder() -> Self::Decoder { BloomFlagsDecoder(ArrayDecoder::new()) }
-}
-
-/// An error occurring when decoding a [`BloomFlags`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BloomFlagsDecoderError {
-    /// Inner decoder error.
-    Decoder(<ArrayDecoder<1> as encoding::Decoder>::Error),
-    /// The flag is not known.
-    UnknownFlag(u8),
-}
-
-impl From<Infallible> for BloomFlagsDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for BloomFlagsDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Decoder(d) => write_err!(f, "bloomflags error"; d),
-            Self::UnknownFlag(flag) => write!(f, "unknown bloomflag {}", flag),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for BloomFlagsDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Decoder(d) => Some(d),
-            Self::UnknownFlag(_f) => None,
-        }
-    }
 }
 
 impl Encodable for BloomFlags {
@@ -264,27 +216,27 @@ pub struct FilterAdd {
     pub data: Vec<u8>,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder of the [`FilterAdd`] message.
+    #[derive(Debug, Clone)]
     pub struct FilterAddEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
 }
 
-impl encoding::Encodable for FilterAdd {
+impl encoding::Encode for FilterAdd {
     type Encoder<'e> = FilterAddEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
-        FilterAddEncoder::new(
-            Encoder2::new(
-                CompactSizeEncoder::new(self.data.len()),
-                BytesEncoder::without_length_prefix(&self.data)
-            )
-        )
+        FilterAddEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.data.len()),
+            BytesEncoder::without_length_prefix(&self.data),
+        ))
     }
 }
 
 type FilterAddInnerDecoder = ByteVecDecoder;
 
 /// The decoder for the [`FilterAdd`] message.
+#[derive(Debug, Clone)]
 pub struct FilterAddDecoder(FilterAddInnerDecoder);
 
 impl encoding::Decoder for FilterAddDecoder {
@@ -306,32 +258,101 @@ impl encoding::Decoder for FilterAddDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for FilterAdd {
+impl encoding::Decode for FilterAdd {
     type Decoder = FilterAddDecoder;
 
     fn decoder() -> Self::Decoder { FilterAddDecoder(FilterAddInnerDecoder::new()) }
 }
 
-/// An error decoding a [`FilterAdd`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterAddDecoderError(<FilterAddInnerDecoder as encoding::Decoder>::Error);
+impl_consensus_encoding!(FilterAdd, data);
 
-impl From<Infallible> for FilterAddDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+/// Error types for bloom filter messages.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl fmt::Display for FilterAddDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "filteradd error"; self)
+    use internals::write_err;
+
+    /// An error occuring when decoding a [`FilterLoad`] message.
+    ///
+    /// [`FilterLoad`]: super::FilterLoad
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilterLoadDecoderError(
+        pub(super) <super::FilterLoadInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for FilterLoadDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for FilterLoadDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "filterload error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for FilterLoadDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error occurring when decoding a [`BloomFlags`].
+    ///
+    /// [`BloomFlags`]: super::BloomFlags
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum BloomFlagsDecoderError {
+        /// Inner decoder error.
+        Decoder(<super::BloomFlagsInnerDecoder as encoding::Decoder>::Error),
+        /// The flag is not known.
+        UnknownFlag(u8),
+    }
+
+    impl From<Infallible> for BloomFlagsDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for BloomFlagsDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Decoder(d) => write_err!(f, "bloomflags error"; d),
+                Self::UnknownFlag(flag) => write!(f, "unknown bloomflag {}", flag),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for BloomFlagsDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Decoder(d) => Some(d),
+                Self::UnknownFlag(_f) => None,
+            }
+        }
+    }
+
+    /// An error decoding a [`FilterAdd`] message.
+    ///
+    /// [`FilterAdd`]: super::FilterAdd
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilterAddDecoderError(
+        pub(super) <super::FilterAddInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for FilterAddDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for FilterAddDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "filteradd error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for FilterAddDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for FilterAddDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
-impl_consensus_encoding!(FilterAdd, data);
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for BloomFlags {

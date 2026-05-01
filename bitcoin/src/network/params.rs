@@ -12,13 +12,14 @@
 //!
 //! ```
 //! use bitcoin::network::Params;
-//! use bitcoin::{WitnessScript, WitnessScriptBuf, Network, Target};
+//! use bitcoin::pow::TargetExt as _;
+//! use bitcoin::{SignetBlockScript, SignetBlockScriptBuf, Network, Target};
 //!
-//! const POW_TARGET_SPACING: u64 = 120; // Two minutes.
+//! const POW_TARGET_SPACING: u32 = 120; // Two minutes.
 //!
 //! pub struct CustomParams {
 //!     params: Params,
-//!     challenge_script: WitnessScriptBuf,
+//!     challenge_script: SignetBlockScriptBuf,
 //! }
 //!
 //! impl CustomParams {
@@ -28,7 +29,7 @@
 //!         params.pow_target_spacing = POW_TARGET_SPACING;
 //!
 //!         // This would be something real (see BIP-00325).
-//!         let challenge_script = WitnessScriptBuf::new();
+//!         let challenge_script = SignetBlockScriptBuf::new();
 //!
 //!         Self {
 //!             params,
@@ -37,7 +38,7 @@
 //!     }
 //!
 //!     /// Returns the custom signet challenge script.
-//!     pub fn challenge_script(&self) -> &WitnessScript { &self.challenge_script }
+//!     pub fn challenge_script(&self) -> &SignetBlockScript { &self.challenge_script }
 //! }
 //!
 //! impl AsRef<Params> for CustomParams {
@@ -104,7 +105,7 @@ pub struct Params {
     /// compact-expressible values between Bitcoin Core's and the limit expressed here.
     pub max_attainable_target: Target,
     /// Expected amount of time to mine one block.
-    pub pow_target_spacing: u64,
+    pub pow_target_spacing: u32,
     /// Difficulty recalculation interval.
     pub pow_target_timespan: u32,
     /// Determines whether minimal difficulty may be used for blocks or not.
@@ -260,8 +261,8 @@ impl Params {
     }
 
     /// Calculates the number of blocks between difficulty adjustments.
-    pub fn difficulty_adjustment_interval(&self) -> u64 {
-        u64::from(self.pow_target_timespan) / self.pow_target_spacing
+    pub fn difficulty_adjustment_interval(&self) -> u32 {
+        self.pow_target_timespan / self.pow_target_spacing
     }
 }
 

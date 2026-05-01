@@ -6,8 +6,6 @@
 //! Bitcoin data (blocks and transactions) around.
 
 use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::fmt;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
@@ -16,7 +14,6 @@ use encoding::{
     ArrayDecoder, ArrayEncoder, CompactSizeEncoder, Decoder2, Decoder3, Encoder2, Encoder3,
     SliceEncoder, VecDecoder,
 };
-use internals::write_err;
 use io::{BufRead, Write};
 use primitives::block::{BlockHashDecoder, BlockHashEncoder};
 use primitives::transaction::{Txid, Wtxid};
@@ -24,6 +21,13 @@ use primitives::BlockHash;
 
 use crate::consensus::impl_consensus_encoding;
 use crate::{ProtocolVersion, ProtocolVersionDecoder, ProtocolVersionEncoder};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{
+    BlockLocatorDecoderError, GetBlocksMessageDecoderError, GetHeadersMessageDecoderError,
+    InventoryDecoderError,
+};
 
 /// An inventory item.
 #[derive(PartialEq, Eq, Clone, Debug, Copy, Hash, PartialOrd, Ord)]
@@ -108,12 +112,13 @@ impl Decodable for Inventory {
     }
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// The encoder for the [`Inventory`] type.
+    #[derive(Debug, Clone)]
     pub struct InventoryEncoder<'e>(Encoder2<ArrayEncoder<4>, ArrayEncoder<32>>);
 }
 
-impl encoding::Encodable for Inventory {
+impl encoding::Encode for Inventory {
     type Encoder<'e> = InventoryEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -137,6 +142,7 @@ impl encoding::Encodable for Inventory {
 type InventoryInnerDecoder = Decoder2<ArrayDecoder<4>, ArrayDecoder<32>>;
 
 /// The decoder for the [`Inventory`] type.
+#[derive(Debug, Clone)]
 pub struct InventoryDecoder(InventoryInnerDecoder);
 
 impl encoding::Decoder for InventoryDecoder {
@@ -168,30 +174,134 @@ impl encoding::Decoder for InventoryDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for Inventory {
+impl encoding::Decode for Inventory {
     type Decoder = InventoryDecoder;
     fn decoder() -> Self::Decoder {
         InventoryDecoder(Decoder2::new(ArrayDecoder::<4>::new(), ArrayDecoder::<32>::new()))
     }
 }
 
-/// An error consensus decoding an [`Inventory`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InventoryDecoderError(<InventoryInnerDecoder as encoding::Decoder>::Error);
+/// A block locator.
+///
+/// Maximum number of hashes in a block locator, matching Bitcoin Core's `MAX_LOCATOR_SZ`.
+pub const MAX_LOCATOR_HASHES: usize = 101;
 
-impl From<Infallible> for InventoryDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+/// An ordered list of block hashes from newest to oldest. Used in `getblocks` and
+/// `getheaders` messages to help a peer find the most recent common block.
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
+pub struct BlockLocator(Vec<BlockHash>);
 
-impl fmt::Display for InventoryDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "inventory error"; self.0)
+impl BlockLocator {
+    /// Returns the locator hashes, ordered newest to oldest.
+    pub fn hashes(&self) -> &[BlockHash] { &self.0 }
+
+    /// Constructs a block locator for the given chain tip.
+    ///
+    /// `get_ancestor(h)` must return the block hash at height `h` on the best chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `get_ancestor` returns an error.
+    pub fn build<F, E>(tip_height: u32, mut get_ancestor: F) -> Result<Self, E>
+    where
+        F: FnMut(u32) -> Result<BlockHash, E>,
+    {
+        let mut hashes = Vec::with_capacity(MAX_LOCATOR_HASHES);
+        let mut step: u32 = 1;
+        let mut height = tip_height;
+
+        loop {
+            hashes.push(get_ancestor(height)?);
+            if height == 0 || hashes.len() >= MAX_LOCATOR_HASHES {
+                break;
+            }
+            height = height.saturating_sub(step);
+            if hashes.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+        }
+
+        Ok(Self(hashes))
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for InventoryDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+impl From<Vec<BlockHash>> for BlockLocator {
+    fn from(hashes: Vec<BlockHash>) -> Self { Self(hashes) }
+}
+
+impl From<BlockLocator> for Vec<BlockHash> {
+    fn from(locator: BlockLocator) -> Self { locator.0 }
+}
+
+impl Encodable for BlockLocator {
+    #[inline]
+    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        self.0.consensus_encode(w)
+    }
+}
+
+impl Decodable for BlockLocator {
+    #[inline]
+    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
+        Ok(Self(Decodable::consensus_decode(r)?))
+    }
+}
+
+type BlockLocatorInnerEncoder<'e> = Encoder2<CompactSizeEncoder, SliceEncoder<'e, BlockHash>>;
+
+encoding::encoder_newtype! {
+    /// The encoder for [`BlockLocator`].
+    #[derive(Debug, Clone)]
+    pub struct BlockLocatorEncoder<'e>(BlockLocatorInnerEncoder<'e>);
+}
+
+impl encoding::Encode for BlockLocator {
+    type Encoder<'e> = BlockLocatorEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        BlockLocatorEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.0.len()),
+            SliceEncoder::without_length_prefix(&self.0),
+        ))
+    }
+}
+
+type BlockLocatorInnerDecoder = VecDecoder<BlockHash>;
+
+/// The decoder for the [`BlockLocator`] type.
+#[derive(Debug, Clone)]
+pub struct BlockLocatorDecoder(BlockLocatorInnerDecoder);
+
+impl BlockLocatorDecoder {
+    /// Creates a new decoder.
+    pub fn new() -> Self { Self(VecDecoder::<BlockHash>::new()) }
+}
+
+impl Default for BlockLocatorDecoder {
+    fn default() -> Self { Self::new() }
+}
+
+impl encoding::Decoder for BlockLocatorDecoder {
+    type Output = BlockLocator;
+    type Error = BlockLocatorDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(BlockLocatorDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        Ok(BlockLocator(self.0.end().map_err(BlockLocatorDecoderError)?))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for BlockLocator {
+    type Decoder = BlockLocatorDecoder;
+    fn decoder() -> Self::Decoder { BlockLocatorDecoder::new() }
 }
 
 // Some simple messages
@@ -201,10 +311,8 @@ impl std::error::Error for InventoryDecoderError {
 pub struct GetBlocksMessage {
     /// The protocol version
     pub version: ProtocolVersion,
-    /// Locator hashes --- ordered newest to oldest. The remote peer will
-    /// reply with its longest known chain, starting from a locator hash
-    /// if possible and block 1 otherwise.
-    pub locator_hashes: Vec<BlockHash>,
+    /// Block locator --- ordered newest to oldest.
+    pub locator_hashes: BlockLocator,
     /// References the block to stop at, or zero to just fetch the maximum 500 blocks
     pub stop_hash: BlockHash,
 }
@@ -214,31 +322,28 @@ pub struct GetBlocksMessage {
 pub struct GetHeadersMessage {
     /// The protocol version
     pub version: ProtocolVersion,
-    /// Locator hashes --- ordered newest to oldest. The remote peer will
-    /// reply with its longest known chain, starting from a locator hash
-    /// if possible and block 1 otherwise.
-    pub locator_hashes: Vec<BlockHash>,
+    /// Block locator --- ordered newest to oldest.
+    pub locator_hashes: BlockLocator,
     /// References the header to stop at, or zero to just fetch the maximum 2000 headers
     pub stop_hash: BlockHash,
 }
 
-type GetBlocksOrHeadersInnerEncoder<'e> = Encoder3<
-    ProtocolVersionEncoder<'e>,
-    Encoder2<CompactSizeEncoder, SliceEncoder<'e, BlockHash>>,
-    BlockHashEncoder<'e>,
->;
+type GetBlocksOrHeadersInnerEncoder<'e> =
+    Encoder3<ProtocolVersionEncoder<'e>, BlockLocatorEncoder<'e>, BlockHashEncoder<'e>>;
 
 encoding::encoder_newtype! {
     /// The encoder for [`GetBlocksMessage`].
+    #[derive(Debug, Clone)]
     pub struct GetBlocksEncoder<'e>(GetBlocksOrHeadersInnerEncoder<'e>);
 }
 
 encoding::encoder_newtype! {
     /// The encoder for [`GetHeadersMessage`].
+    #[derive(Debug, Clone)]
     pub struct GetHeadersEncoder<'e>(GetBlocksOrHeadersInnerEncoder<'e>);
 }
 
-impl encoding::Encodable for GetHeadersMessage {
+impl encoding::Encode for GetHeadersMessage {
     type Encoder<'e>
         = GetHeadersEncoder<'e>
     where
@@ -247,16 +352,13 @@ impl encoding::Encodable for GetHeadersMessage {
     fn encoder(&self) -> Self::Encoder<'_> {
         GetHeadersEncoder::new(Encoder3::new(
             self.version.encoder(),
-            Encoder2::new(
-                CompactSizeEncoder::new(self.locator_hashes.len()),
-                SliceEncoder::without_length_prefix(&self.locator_hashes),
-            ),
+            self.locator_hashes.encoder(),
             self.stop_hash.encoder(),
         ))
     }
 }
 
-impl encoding::Encodable for GetBlocksMessage {
+impl encoding::Encode for GetBlocksMessage {
     type Encoder<'e>
         = GetBlocksEncoder<'e>
     where
@@ -265,22 +367,21 @@ impl encoding::Encodable for GetBlocksMessage {
     fn encoder(&self) -> Self::Encoder<'_> {
         GetBlocksEncoder::new(Encoder3::new(
             self.version.encoder(),
-            Encoder2::new(
-                CompactSizeEncoder::new(self.locator_hashes.len()),
-                SliceEncoder::without_length_prefix(&self.locator_hashes),
-            ),
+            self.locator_hashes.encoder(),
             self.stop_hash.encoder(),
         ))
     }
 }
 
 type GetBlocksOrHeadersInnerDecoder =
-    Decoder3<ProtocolVersionDecoder, VecDecoder<BlockHash>, BlockHashDecoder>;
+    Decoder3<ProtocolVersionDecoder, BlockLocatorDecoder, BlockHashDecoder>;
 
 /// Decoder type for [`GetBlocksMessage`].
+#[derive(Debug, Clone)]
 pub struct GetBlocksMessageDecoder(GetBlocksOrHeadersInnerDecoder);
 
 /// Decoder type for [`GetHeadersMessage`].
+#[derive(Debug, Clone)]
 pub struct GetHeadersMessageDecoder(GetBlocksOrHeadersInnerDecoder);
 
 impl encoding::Decoder for GetHeadersMessageDecoder {
@@ -323,80 +424,145 @@ impl encoding::Decoder for GetBlocksMessageDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for GetBlocksMessage {
+impl encoding::Decode for GetBlocksMessage {
     type Decoder = GetBlocksMessageDecoder;
     fn decoder() -> Self::Decoder {
         GetBlocksMessageDecoder(Decoder3::new(
             ProtocolVersionDecoder::new(),
-            VecDecoder::<BlockHash>::new(),
+            BlockLocatorDecoder::new(),
             BlockHashDecoder::new(),
         ))
     }
 }
 
-impl encoding::Decodable for GetHeadersMessage {
+impl encoding::Decode for GetHeadersMessage {
     type Decoder = GetHeadersMessageDecoder;
     fn decoder() -> Self::Decoder {
         GetHeadersMessageDecoder(Decoder3::new(
             ProtocolVersionDecoder::new(),
-            VecDecoder::<BlockHash>::new(),
+            BlockLocatorDecoder::new(),
             BlockHashDecoder::new(),
         ))
     }
-}
-
-/// An error consensus decoding a [`GetBlocksMessage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetBlocksMessageDecoderError(
-    <GetBlocksOrHeadersInnerDecoder as encoding::Decoder>::Error,
-);
-
-impl From<Infallible> for GetBlocksMessageDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for GetBlocksMessageDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "getblocks decoder error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for GetBlocksMessageDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
-/// An error consensus decoding a [`GetHeadersMessage`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetHeadersMessageDecoderError(
-    <GetBlocksOrHeadersInnerDecoder as encoding::Decoder>::Error,
-);
-
-impl From<Infallible> for GetHeadersMessageDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for GetHeadersMessageDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "getheaders decoder error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for GetHeadersMessageDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(GetBlocksMessage, version, locator_hashes, stop_hash);
 
 impl_consensus_encoding!(GetHeadersMessage, version, locator_hashes, stop_hash);
 
+/// Error types for blockdata messages.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    /// An error consensus decoding an [`Inventory`].
+    ///
+    /// [`Inventory`]: super::Inventory
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InventoryDecoderError(
+        pub(super) <super::InventoryInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for InventoryDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for InventoryDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "inventory error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InventoryDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a [`BlockLocator`].
+    ///
+    /// [`BlockLocator`]: super::BlockLocator
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BlockLocatorDecoderError(
+        pub(super) <super::BlockLocatorInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for BlockLocatorDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for BlockLocatorDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "block locator error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for BlockLocatorDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a [`GetBlocksMessage`].
+    ///
+    /// [`GetBlocksMessage`]: super::GetBlocksMessage
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetBlocksMessageDecoderError(
+        pub(super) <super::GetBlocksOrHeadersInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for GetBlocksMessageDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for GetBlocksMessageDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "getblocks decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for GetBlocksMessageDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a [`GetHeadersMessage`].
+    ///
+    /// [`GetHeadersMessage`]: super::GetHeadersMessage
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetHeadersMessageDecoderError(
+        pub(super) <super::GetBlocksOrHeadersInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for GetHeadersMessageDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for GetHeadersMessageDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "getheaders decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for GetHeadersMessageDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for BlockLocator {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self::from(Vec::<BlockHash>::arbitrary(u)?))
+    }
+}
+
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for GetHeadersMessage {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
             version: u.arbitrary()?,
-            locator_hashes: Vec::<BlockHash>::arbitrary(u)?,
+            locator_hashes: u.arbitrary()?,
             stop_hash: u.arbitrary()?,
         })
     }
@@ -407,7 +573,7 @@ impl<'a> Arbitrary<'a> for GetBlocksMessage {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
             version: u.arbitrary()?,
-            locator_hashes: Vec::<BlockHash>::arbitrary(u)?,
+            locator_hashes: u.arbitrary()?,
             stop_hash: u.arbitrary()?,
         })
     }
@@ -431,8 +597,7 @@ impl<'a> Arbitrary<'a> for Inventory {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin::consensus::encode::{deserialize, serialize};
-    use hex_lit::hex;
+    use hex_unstable::hex;
 
     use super::*;
 
@@ -441,15 +606,15 @@ mod tests {
         let from_sat = hex!("72110100014a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b0000000000000000000000000000000000000000000000000000000000000000");
         let genhash = hex!("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
 
-        let decode: Result<GetBlocksMessage, _> = deserialize(&from_sat);
+        let decode: Result<GetBlocksMessage, _> = encoding::decode_from_slice(&from_sat);
         assert!(decode.is_ok());
         let real_decode = decode.unwrap();
         assert_eq!(real_decode.version.0, 70002);
-        assert_eq!(real_decode.locator_hashes.len(), 1);
-        assert_eq!(serialize(&real_decode.locator_hashes[0]), genhash);
+        assert_eq!(real_decode.locator_hashes.hashes().len(), 1);
+        assert_eq!(encoding::encode_to_vec(&real_decode.locator_hashes.hashes()[0]), genhash);
         assert_eq!(real_decode.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
 
-        assert_eq!(serialize(&real_decode), from_sat);
+        assert_eq!(encoding::encode_to_vec(&real_decode), from_sat);
     }
 
     #[test]
@@ -457,14 +622,14 @@ mod tests {
         let from_sat = hex!("72110100014a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b0000000000000000000000000000000000000000000000000000000000000000");
         let genhash = hex!("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b");
 
-        let decode: Result<GetHeadersMessage, _> = deserialize(&from_sat);
+        let decode: Result<GetHeadersMessage, _> = encoding::decode_from_slice(&from_sat);
         assert!(decode.is_ok());
         let real_decode = decode.unwrap();
         assert_eq!(real_decode.version.0, 70002);
-        assert_eq!(real_decode.locator_hashes.len(), 1);
-        assert_eq!(serialize(&real_decode.locator_hashes[0]), genhash);
+        assert_eq!(real_decode.locator_hashes.hashes().len(), 1);
+        assert_eq!(encoding::encode_to_vec(&real_decode.locator_hashes.hashes()[0]), genhash);
         assert_eq!(real_decode.stop_hash, BlockHash::GENESIS_PREVIOUS_BLOCK_HASH);
 
-        assert_eq!(serialize(&real_decode), from_sat);
+        assert_eq!(encoding::encode_to_vec(&real_decode), from_sat);
     }
 }

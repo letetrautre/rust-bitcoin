@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin - unit types
+//! # Rust Bitcoin Unit Types
 //!
 //! This library provides basic types used by the Rust Bitcoin ecosystem.
 //!
@@ -34,6 +34,15 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+#[cfg(feature = "encoding")]
+pub extern crate encoding;
+
+#[cfg(feature = "serde")]
+pub extern crate serde;
+
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+
 #[doc(hidden)]
 pub mod _export {
     /// A re-export of `core::*`.
@@ -50,6 +59,7 @@ pub mod block;
 pub mod fee_rate;
 pub mod locktime;
 pub mod parse_int;
+pub mod pow;
 pub mod result;
 pub mod sequence;
 pub mod time;
@@ -62,6 +72,7 @@ pub use self::{
     block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
     fee_rate::FeeRate,
     locktime::{absolute, relative},
+    pow::{CompactTarget, Target, Work},
     result::NumOpResult,
     sequence::Sequence,
     time::BlockTime,
@@ -71,3 +82,7 @@ pub use self::{
 #[deprecated(since = "1.0.0-rc.0", note = "use `BlockHeightInterval` instead")]
 #[doc(hidden)]
 pub type BlockInterval = BlockHeightInterval;
+
+// decoder_newtype! macro
+#[cfg(feature = "encoding")]
+include!("../include/decoder_newtype.rs");

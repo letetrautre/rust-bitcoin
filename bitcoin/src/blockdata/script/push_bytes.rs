@@ -6,6 +6,7 @@ use core::fmt;
 use core::ops::{Deref, DerefMut};
 
 use crate::crypto::{ecdsa, taproot};
+use crate::internal_macros::impl_asref_push_bytes;
 use crate::prelude::{Borrow, BorrowMut};
 use crate::script;
 
@@ -37,7 +38,8 @@ mod primitive {
         }
     }
 
-    internals::transparent_newtype! {
+    // Defined in `REPO_DIR/include/newtype.rs`.
+    transparent_newtype! {
         /// Byte slices that can be in Bitcoin script.
         ///
         /// The encoding of Bitcoin script restricts data pushes to be less than 2^32 bytes long.
@@ -435,6 +437,14 @@ impl AsRef<PushBytes> for taproot::SerializedSignature {
     }
 }
 
+impl_asref_push_bytes! {
+    hashes::ripemd160::Hash,
+    hashes::hash160::Hash,
+    hashes::sha1::Hash,
+    hashes::sha256::Hash,
+    hashes::sha256d::Hash,
+}
+
 /// Possible errors that can arise from [`PushBytes::read_scriptint`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -446,7 +456,14 @@ pub enum ScriptIntError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for ScriptIntError {}
+impl std::error::Error for ScriptIntError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NumericOverflow => None,
+            Self::NonMinimal => None,
+        }
+    }
+}
 
 impl fmt::Display for ScriptIntError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -3,7 +3,7 @@
 use core::fmt;
 
 use super::{opcode_to_verify, Error, PushBytes, Script, ScriptBuf};
-use crate::key::{PublicKey, XOnlyPublicKey};
+use crate::key::{LegacyPublicKey, XOnlyPublicKey};
 use crate::locktime::absolute;
 use crate::opcodes::all::*;
 use crate::opcodes::Opcode;
@@ -136,17 +136,17 @@ impl<T> Builder<T> {
     }
 
     /// Adds instructions to push a public key onto the stack.
-    pub fn push_key(self, key: PublicKey) -> Self {
-        if key.compressed {
-            self.push_slice(key.inner.serialize())
+    pub fn push_key(self, key: LegacyPublicKey) -> Self {
+        if key.compressed() {
+            self.push_slice(key.serialize_compressed())
         } else {
-            self.push_slice(key.inner.serialize_uncompressed())
+            self.push_slice(key.serialize_uncompressed())
         }
     }
 
     /// Adds instructions to push an XOnly public key onto the stack.
     pub fn push_x_only_key(self, x_only_key: XOnlyPublicKey) -> Self {
-        self.push_slice(x_only_key.serialize())
+        self.push_slice(x_only_key.serialize().0)
     }
 
     /// Adds instructions to push an absolute lock time onto the stack.
@@ -209,5 +209,5 @@ impl<T> fmt::Display for Builder<T> {
 }
 
 impl<T> fmt::Debug for Builder<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> { fmt::Display::fmt(self, f) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(self, f) }
 }

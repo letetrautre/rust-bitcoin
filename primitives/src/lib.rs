@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin - primitive types
+//! # Rust Bitcoin Primitive Types
 //!
 //! Primitive data types that are used throughout the [`rust-bitcoin`] ecosystem.
 //!
@@ -27,7 +27,12 @@ extern crate std;
 
 #[cfg(feature = "serde")]
 #[macro_use]
-extern crate serde;
+pub extern crate serde;
+
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+
+pub extern crate encoding;
 
 #[cfg(feature = "hex")]
 pub extern crate hex_stable as hex;
@@ -46,12 +51,18 @@ mod opcodes;
 
 pub mod block;
 pub mod merkle_tree;
-pub mod pow;
 #[cfg(feature = "alloc")]
 pub mod script;
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+#[cfg(feature = "serde")]
+pub mod serde_as_consensus;
 pub mod transaction;
 #[cfg(feature = "alloc")]
 pub mod witness;
+
+#[cfg(feature = "hex")]
+mod hex_codec;
 
 #[doc(inline)]
 pub use units::{
@@ -60,6 +71,7 @@ pub use units::{
     fee_rate::{self, FeeRate},
     locktime::{self, absolute, relative},
     parse_int,
+    pow::{self, CompactTarget, Target, Work},
     result::{self, NumOpResult},
     sequence::{self, Sequence},
     time::{self, BlockTime},
@@ -78,7 +90,8 @@ pub use self::{
     },
     script::{
         RedeemScript, RedeemScriptBuf, ScriptPubKey, ScriptPubKeyBuf, ScriptSig, ScriptSigBuf,
-        TapScript, TapScriptBuf, WitnessScript, WitnessScriptBuf,
+        SignetBlockScript, SignetBlockScriptBuf, TapScript, TapScriptBuf, WitnessScript,
+        WitnessScriptBuf,
     },
     transaction::{Transaction, TxIn, TxOut},
     witness::Witness,
@@ -86,9 +99,7 @@ pub use self::{
 #[doc(inline)]
 pub use self::{
     block::{BlockHash, Header as BlockHeader, Version as BlockVersion, WitnessCommitment},
-    merkle_tree::{TxMerkleNode, WitnessMerkleNode},
-    pow::CompactTarget,
-    transaction::{Ntxid, OutPoint, Txid, Version as TransactionVersion, Wtxid},
+    transaction::{OutPoint, Txid, Version as TransactionVersion, Wtxid},
 };
 
 #[rustfmt::skip]
@@ -100,7 +111,8 @@ mod prelude {
     #[cfg(feature = "alloc")]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
 
-    #[cfg(all(feature = "alloc", target_has_atomic = "ptr"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(target_has_atomic = "ptr")]
     pub use alloc::sync;
 }
 
@@ -116,196 +128,6 @@ pub(crate) fn compact_size_encode(value: usize) -> ArrayVec<u8, 9> {
     ArrayVec::from_slice(encoder.current_chunk())
 }
 
-#[cfg(all(feature = "hex", feature = "alloc"))]
-use core::{convert, fmt};
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-use encoding::{Decodable, Decoder};
-#[cfg(all(feature = "hex", feature = "alloc"))]
-use internals::write_err;
-
-/// An error type for errors that can occur during parsing of a `Decodable` type from hex.
-#[cfg(all(feature = "hex", feature = "alloc"))]
-enum ParsePrimitiveError<T: Decodable> {
-    /// Tried to decode an odd length string
-    OddLengthString(hex::error::OddLengthStringError),
-    /// Encountered an invalid hex character
-    InvalidChar(hex::error::InvalidCharError),
-    /// A decode error from `consensus_encoding`
-    Decode(<T::Decoder as Decoder>::Error),
-}
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-impl<T: Decodable> fmt::Debug for ParsePrimitiveError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OddLengthString(ref e) => write_err!(f, "odd length string"; e),
-            Self::InvalidChar(ref e) => write_err!(f, "invalid character"; e),
-            // Decoder error types don't have Debug, so we only provide this generic error
-            Self::Decode(_) =>
-                write!(f, "failure decoding hex string into {}", core::any::type_name::<T>()),
-        }
-    }
-}
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-impl<T: Decodable> fmt::Display for ParsePrimitiveError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(&self, f) }
-}
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-impl<T: Decodable> From<hex::DecodeVariableLengthBytesError> for ParsePrimitiveError<T> {
-    fn from(dec_err: hex::DecodeVariableLengthBytesError) -> Self {
-        use hex::DecodeVariableLengthBytesError as D;
-
-        match dec_err {
-            D::InvalidChar(err) => Self::InvalidChar(err),
-            D::OddLengthString(err) => Self::OddLengthString(err),
-        }
-    }
-}
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-impl<T: Decodable> From<convert::Infallible> for ParsePrimitiveError<T> {
-    fn from(never: convert::Infallible) -> Self { match never {} }
-}
-
-#[cfg(all(feature = "hex", feature = "alloc", feature = "std"))]
-impl<T: Decodable> std::error::Error for ParsePrimitiveError<T> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::OddLengthString(ref e) => Some(e),
-            Self::InvalidChar(ref e) => Some(e),
-            Self::Decode(_) => None,
-        }
-    }
-}
-
-#[cfg(all(feature = "hex", feature = "alloc"))]
-pub(crate) mod hex_codec {
-    use encoding::{Encodable, EncodableByteIter};
-    use hex_unstable::{BytesToHexIter, Case};
-
-    use super::{fmt, Decodable, ParsePrimitiveError};
-
-    /// Writes an Encodable object to the given formatter in the requested case.
-    #[inline]
-    fn hex_write_with_case<T: Encodable + Decodable>(
-        obj: &HexPrimitive<T>,
-        f: &mut fmt::Formatter,
-        case: Case,
-    ) -> fmt::Result {
-        let iter = BytesToHexIter::new(encoding::EncodableByteIter::new(obj.0), case);
-        let collection = iter.collect::<alloc::string::String>();
-        f.pad(&collection)
-    }
-
-    /// Hex encoding wrapper type for Encodable + Decodable types.
-    ///
-    /// Provides default implementations for `Display`, `Debug`, `LowerHex`, and `UpperHex`.
-    /// Also provides [`Self::from_str`] for parsing a string to a `T`.
-    /// This can be used to implement hex display traits for any encodable types.
-    pub(crate) struct HexPrimitive<'a, T: Encodable + Decodable>(pub &'a T);
-
-    impl<'a, T: Encodable + Decodable> IntoIterator for &HexPrimitive<'a, T> {
-        type Item = u8;
-        type IntoIter = EncodableByteIter<'a, T>;
-
-        fn into_iter(self) -> Self::IntoIter { EncodableByteIter::new(self.0) }
-    }
-
-    impl<T: Encodable + Decodable> HexPrimitive<'_, T> {
-        /// Parses a given string into an instance of the type `T`.
-        ///
-        /// Since `FromStr` would return an instance of Self and thus a &T, this function
-        /// is implemented directly on the struct to return the owned instance of T.
-        /// Other `FromStr` implementations can directly return the result of
-        /// [`HexPrimitive::from_str`].
-        ///
-        /// # Errors
-        ///
-        /// [`ParsePrimitiveError::OddLengthString`] if the input string is an odd length.
-        /// [`ParsePrimitiveError::Decode`] if an error occurs during decoding of the object.
-        pub(crate) fn from_str(s: &str) -> Result<T, ParsePrimitiveError<T>> {
-            let bytes = hex::decode_to_vec(s).map_err(ParsePrimitiveError::from)?;
-
-            encoding::decode_from_slice(&bytes).map_err(ParsePrimitiveError::Decode)
-        }
-    }
-
-    impl<T: Encodable + Decodable> fmt::Display for HexPrimitive<'_, T> {
-        #[inline]
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(self, f) }
-    }
-
-    impl<T: Encodable + Decodable> fmt::Debug for HexPrimitive<'_, T> {
-        #[inline]
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(self, f) }
-    }
-
-    impl<T: Encodable + Decodable> fmt::LowerHex for HexPrimitive<'_, T> {
-        #[inline]
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            hex_write_with_case(self, f, Case::Lower)
-        }
-    }
-
-    impl<T: Encodable + Decodable> fmt::UpperHex for HexPrimitive<'_, T> {
-        #[inline]
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            hex_write_with_case(self, f, Case::Upper)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(feature = "alloc")]
-    use alloc::{format, string::ToString};
-
-    #[cfg(feature = "alloc")]
-    use super::*;
-
-    #[test]
-    #[cfg(all(feature = "alloc", feature = "hex"))]
-    fn parse_primitive_error_display() {
-        let odd: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("0").unwrap_err();
-        let invalid: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("zz").unwrap_err();
-        let decode: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("00").unwrap_err();
-
-        assert!(!odd.to_string().is_empty());
-        assert!(!invalid.to_string().is_empty());
-        assert!(!decode.to_string().is_empty());
-    }
-
-    #[test]
-    #[cfg(all(feature = "hex", feature = "std"))]
-    fn parse_primitive_error_source() {
-        use std::error::Error as _;
-
-        let odd: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("0").unwrap_err();
-        let invalid: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("zz").unwrap_err();
-        let decode: ParsePrimitiveError<block::Header> =
-            hex_codec::HexPrimitive::from_str("00").unwrap_err();
-
-        assert!(odd.source().is_some());
-        assert!(invalid.source().is_some());
-        assert!(decode.source().is_none());
-    }
-
-    #[test]
-    #[cfg(all(feature = "alloc", feature = "hex"))]
-    fn hex_primitive_iter_and_debug() {
-        let header: block::Header =
-            encoding::decode_from_slice(&[0u8; block::Header::SIZE]).expect("valid header");
-        let hex = hex_codec::HexPrimitive(&header);
-
-        assert_eq!((&hex).into_iter().next(), Some(0u8));
-        assert!(!format!("{hex:?}").is_empty());
-    }
-}
+#[cfg(feature = "alloc")]
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
+include!("../include/decoder_newtype.rs"); // decoder_newtype! macro

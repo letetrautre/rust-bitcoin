@@ -16,6 +16,15 @@ use crate::result::{MathOp, NumOpError, NumOpResult};
 use crate::FeeRate;
 use crate::Weight;
 
+fn amt_err(e: ParseAmountErrorInner) -> ParseAmountError { ParseAmountError(e) }
+
+fn parse_err(e: ParseAmountErrorInner) -> ParseError {
+    ParseError(ParseErrorInner::Amount(ParseAmountError(e)))
+}
+fn denom_err(e: ParseDenominationError) -> ParseError {
+    ParseError(ParseErrorInner::Denomination(e))
+}
+
 #[track_caller]
 fn sat(sat: u64) -> Amount { Amount::from_sat(sat).unwrap() }
 
@@ -362,22 +371,31 @@ fn floating_point() {
     assert_eq!(f(0.000_123_4, D::Bitcoin), Ok(sat(12_340)));
     assert_eq!(sf(-0.000_123_45, D::Bitcoin), Ok(ssat(-12_345)));
 
-    assert_eq!(f(11.22, D::Satoshi), Err(TooPreciseError { position: 3 }.into()));
-    assert_eq!(f(42.123_456_781, D::Bitcoin), Err(TooPreciseError { position: 11 }.into()));
-    assert_eq!(sf(-184_467_440_738.0, D::Bitcoin), Err(OutOfRangeError::too_small().into()));
+    assert_eq!(
+        f(11.22, D::Satoshi),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 3 })))
+    );
+    assert_eq!(
+        f(42.123_456_781, D::Bitcoin),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 11 })))
+    );
+    assert_eq!(
+        sf(-184_467_440_738.0, D::Bitcoin),
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_small())))
+    );
     assert_eq!(
         f(18_446_744_073_709_551_617.0, D::Satoshi),
-        Err(OutOfRangeError::too_big(false).into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false))))
     );
 
     assert_eq!(
         f(Amount::MAX.to_float_in(D::Satoshi) + 1.0, D::Satoshi),
-        Err(OutOfRangeError::too_big(false).into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false))))
     );
 
     assert_eq!(
         sf(SignedAmount::MAX.to_float_in(D::Satoshi) + 1.0, D::Satoshi),
-        Err(OutOfRangeError::too_big(true).into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(true))))
     );
 
     let btc = move |f| SignedAmount::from_btc(f).unwrap();
@@ -402,38 +420,69 @@ fn parsing() {
 
     assert_eq!(
         p("x", den_btc),
-        Err(E::from(InvalidCharacterError { invalid_char: 'x', position: 0 }))
+        Err(amt_err(ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+            invalid_char: 'x',
+            position: 0
+        })))
     );
     assert_eq!(
         p("-", den_btc),
-        Err(E::from(MissingDigitsError { kind: MissingDigitsKind::OnlyMinusSign }))
+        Err(amt_err(ParseAmountErrorInner::MissingDigits(MissingDigitsError {
+            kind: MissingDigitsKind::OnlyMinusSign
+        })))
     );
     assert_eq!(
         sp("-", den_btc),
-        Err(E::from(MissingDigitsError { kind: MissingDigitsKind::OnlyMinusSign }))
+        Err(amt_err(ParseAmountErrorInner::MissingDigits(MissingDigitsError {
+            kind: MissingDigitsKind::OnlyMinusSign
+        })))
     );
     assert_eq!(
         p("-1.0x", den_btc),
-        Err(E::from(InvalidCharacterError { invalid_char: 'x', position: 4 }))
+        Err(amt_err(ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+            invalid_char: 'x',
+            position: 4
+        })))
     );
     assert_eq!(
         p("0.0 ", den_btc),
-        Err(E::from(InvalidCharacterError { invalid_char: ' ', position: 3 }))
+        Err(amt_err(ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+            invalid_char: ' ',
+            position: 3
+        })))
     );
     assert_eq!(
         p("0.000.000", den_btc),
-        Err(E::from(InvalidCharacterError { invalid_char: '.', position: 5 }))
+        Err(amt_err(ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+            invalid_char: '.',
+            position: 5
+        })))
     );
     #[cfg(feature = "alloc")]
     let more_than_max = format!("{}", Amount::MAX.to_sat() + 1);
     #[cfg(feature = "alloc")]
-    assert_eq!(p(&more_than_max, den_btc), Err(OutOfRangeError::too_big(false).into()));
-    assert_eq!(p("0.000000042", den_btc), Err(TooPreciseError { position: 10 }.into()));
+    assert_eq!(
+        p(&more_than_max, den_btc),
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false))))
+    );
+    assert_eq!(
+        p("0.000000042", den_btc),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 10 })))
+    );
     assert_eq!(p("1.0000000", den_sat), Ok(sat(1)));
-    assert_eq!(p("1.1", den_sat), Err(TooPreciseError { position: 2 }.into()));
-    assert_eq!(p("1000.1", den_sat), Err(TooPreciseError { position: 5 }.into()));
+    assert_eq!(
+        p("1.1", den_sat),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 2 })))
+    );
+    assert_eq!(
+        p("1000.1", den_sat),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 5 })))
+    );
     assert_eq!(p("1001.0000000", den_sat), Ok(sat(1001)));
-    assert_eq!(p("1000.0000001", den_sat), Err(TooPreciseError { position: 11 }.into()));
+    assert_eq!(
+        p("1000.0000001", den_sat),
+        Err(amt_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 11 })))
+    );
 
     assert_eq!(p("1", den_btc), Ok(sat(1_000_000_00)));
     assert_eq!(sp("-.5", den_btc), Ok(ssat(-500_000_00)));
@@ -449,7 +498,7 @@ fn parsing() {
     // exactly 50 chars.
     assert_eq!(
         p("100000000000000.0000000000000000000000000000000000", Denomination::Bitcoin),
-        Err(OutOfRangeError::too_big(false).into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false))))
     );
     // more than 50 chars.
     assert_eq!(
@@ -659,28 +708,45 @@ fn unsigned_signed_conversion() {
 #[test]
 #[allow(clippy::inconsistent_digit_grouping)] // Group to show 100,000,000 sats per bitcoin.
 #[allow(clippy::items_after_statements)] // Define functions where we use them.
+#[allow(clippy::too_many_lines)]
 fn from_str() {
-    use super::{ParseAmountError as E, ParseDenominationError};
+    use super::ParseDenominationError;
 
     assert_eq!(
         "x BTC".parse::<Amount>(),
-        Err(InvalidCharacterError { invalid_char: 'x', position: 0 }.into())
+        Err(ParseError(ParseErrorInner::Amount(ParseAmountError(
+            ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+                invalid_char: 'x',
+                position: 0
+            })
+        ))))
     );
     assert_eq!(
         "xBTC".parse::<Amount>(),
-        Err(ParseDenominationError::Unknown(UnknownDenominationError("xBTC".into())).into()),
+        Err(ParseError(ParseErrorInner::Denomination(ParseDenominationError::Unknown(
+            UnknownDenominationError("xBTC".into())
+        )))),
     );
     assert_eq!(
         "5 BTC BTC".parse::<Amount>(),
-        Err(ParseDenominationError::Unknown(UnknownDenominationError("BTC BTC".into())).into()),
+        Err(ParseError(ParseErrorInner::Denomination(ParseDenominationError::Unknown(
+            UnknownDenominationError("BTC BTC".into())
+        )))),
     );
     assert_eq!(
         "5BTC BTC".parse::<Amount>(),
-        Err(E::from(InvalidCharacterError { invalid_char: 'B', position: 1 }).into())
+        Err(ParseError(ParseErrorInner::Amount(ParseAmountError(
+            ParseAmountErrorInner::InvalidCharacter(InvalidCharacterError {
+                invalid_char: 'B',
+                position: 1
+            })
+        ))))
     );
     assert_eq!(
         "5 5 BTC".parse::<Amount>(),
-        Err(ParseDenominationError::Unknown(UnknownDenominationError("5 BTC".into())).into()),
+        Err(ParseError(ParseErrorInner::Denomination(ParseDenominationError::Unknown(
+            UnknownDenominationError("5 BTC".into())
+        )))),
     );
 
     #[track_caller]
@@ -690,10 +756,9 @@ fn from_str() {
     }
 
     #[track_caller]
-    fn case(s: &str, expected: Result<Amount, impl Into<ParseError>>) {
-        let expected = expected.map_err(Into::into);
-        assert_eq!(s.parse::<Amount>(), expected);
-        assert_eq!(s.replace(' ', "").parse::<Amount>(), expected);
+    fn case(s: &str, expected: &Result<Amount, ParseError>) {
+        assert_eq!(s.parse::<Amount>(), *expected);
+        assert_eq!(s.replace(' ', "").parse::<Amount>(), *expected);
     }
 
     #[track_caller]
@@ -703,29 +768,82 @@ fn from_str() {
     }
 
     #[track_caller]
-    fn scase(s: &str, expected: Result<SignedAmount, impl Into<ParseError>>) {
-        let expected = expected.map_err(Into::into);
-        assert_eq!(s.parse::<SignedAmount>(), expected);
-        assert_eq!(s.replace(' ', "").parse::<SignedAmount>(), expected);
+    fn scase(s: &str, expected: &Result<SignedAmount, ParseError>) {
+        assert_eq!(s.parse::<SignedAmount>(), *expected);
+        assert_eq!(s.replace(' ', "").parse::<SignedAmount>(), *expected);
     }
 
-    case("5 BCH", Err(ParseDenominationError::Unknown(UnknownDenominationError("BCH".into()))));
+    case(
+        "5 BCH",
+        &Err(denom_err(ParseDenominationError::Unknown(UnknownDenominationError("BCH".into())))),
+    );
 
-    case("-1 BTC", Err(OutOfRangeError::negative()));
-    case("-0.0 BTC", Err(OutOfRangeError::negative()));
-    case("0.123456789 BTC", Err(TooPreciseError { position: 10 }));
-    scase("-0.1 satoshi", Err(TooPreciseError { position: 3 }));
-    case("0.123456 mBTC", Err(TooPreciseError { position: 7 }));
-    scase("-1.001 bits", Err(TooPreciseError { position: 5 }));
-    scase("-21000001 BTC", Err(OutOfRangeError::too_small()));
-    scase("21000001 BTC", Err(OutOfRangeError::too_big(true)));
-    scase("-2100000000000001 SAT", Err(OutOfRangeError::too_small()));
-    scase("2100000000000001 SAT", Err(OutOfRangeError::too_big(true)));
-    case("21000001 BTC", Err(OutOfRangeError::too_big(false)));
-    case("18446744073709551616 sat", Err(OutOfRangeError::too_big(false)));
-    case("_1000 sat", Err(BadPositionError { char: '_', position: 0 }));
-    case("10__00 sat", Err(BadPositionError { char: '_', position: 3 }));
-    scase("-_10_00 sat", Err(BadPositionError { char: '_', position: 1 }));
+    case("-1 BTC", &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::negative()))));
+    case(
+        "-0.0 BTC",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::negative()))),
+    );
+    case(
+        "0.123456789 BTC",
+        &Err(parse_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 10 }))),
+    );
+    scase(
+        "-0.1 satoshi",
+        &Err(parse_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 3 }))),
+    );
+    case(
+        "0.123456 mBTC",
+        &Err(parse_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 7 }))),
+    );
+    scase(
+        "-1.001 bits",
+        &Err(parse_err(ParseAmountErrorInner::TooPrecise(TooPreciseError { position: 5 }))),
+    );
+    scase(
+        "-21000001 BTC",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_small()))),
+    );
+    scase(
+        "21000001 BTC",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(true)))),
+    );
+    scase(
+        "-2100000000000001 SAT",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_small()))),
+    );
+    scase(
+        "2100000000000001 SAT",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(true)))),
+    );
+    case(
+        "21000001 BTC",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false)))),
+    );
+    case(
+        "18446744073709551616 sat",
+        &Err(parse_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(false)))),
+    );
+    case(
+        "_1000 sat",
+        &Err(parse_err(ParseAmountErrorInner::BadPosition(BadPositionError {
+            char: '_',
+            position: 0,
+        }))),
+    );
+    case(
+        "10__00 sat",
+        &Err(parse_err(ParseAmountErrorInner::BadPosition(BadPositionError {
+            char: '_',
+            position: 3,
+        }))),
+    );
+    scase(
+        "-_10_00 sat",
+        &Err(parse_err(ParseAmountErrorInner::BadPosition(BadPositionError {
+            char: '_',
+            position: 1,
+        }))),
+    );
 
     ok_case(".5 bits", sat(50));
     ok_scase("-.5 bits", ssat(-50));
@@ -809,12 +927,12 @@ fn to_from_string_in() {
 
     assert_eq!(
         sa_str(&SignedAmount::MAX.to_string_in(D::Satoshi), D::MicroBitcoin),
-        Err(OutOfRangeError::too_big(true).into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_big(true))))
     );
     // Test an overflow bug in `abs()`
     assert_eq!(
         sa_str(&SignedAmount::MIN.to_string_in(D::Satoshi), D::MicroBitcoin),
-        Err(OutOfRangeError::too_small().into())
+        Err(amt_err(ParseAmountErrorInner::OutOfRange(OutOfRangeError::too_small())))
     );
 }
 
@@ -834,11 +952,15 @@ fn to_string_with_denomination_from_str_roundtrip() {
 
     assert_eq!(
         "42 satoshi BTC".parse::<Amount>(),
-        Err(ParseDenominationError::Unknown(UnknownDenominationError("satoshi BTC".into())).into(),),
+        Err(ParseError(ParseErrorInner::Denomination(ParseDenominationError::Unknown(
+            UnknownDenominationError("satoshi BTC".into())
+        ))))
     );
     assert_eq!(
         "-42 satoshi BTC".parse::<SignedAmount>(),
-        Err(ParseDenominationError::Unknown(UnknownDenominationError("satoshi BTC".into())).into(),),
+        Err(ParseError(ParseErrorInner::Denomination(ParseDenominationError::Unknown(
+            UnknownDenominationError("satoshi BTC".into())
+        )))),
     );
 }
 
@@ -1269,8 +1391,6 @@ fn num_op_result_ops_integer() {
 // Verify we have implemented all `Neg` for the amount types.
 #[test]
 fn amount_op_result_neg() {
-    // TODO: Implement Neg all round.
-
     // let sat = Amount::from_sat(1).unwrap();
     let ssat = SignedAmount::from_sat(1).unwrap();
 

@@ -1,32 +1,39 @@
 [package]
 name = "bitcoin_hashes"
-version = "0.19.0"
+version = "0.20.0"
 authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
 license = "CC0-1.0"
 repository = "https://github.com/rust-bitcoin/rust-bitcoin"
+homepage = "https://rust-bitcoin.org"
 documentation = "https://docs.rs/bitcoin_hashes/"
-description = "Hash functions used by the rust-bitcoin eccosystem"
+description = "Hash functions used by the rust-bitcoin ecosystem"
 categories = ["algorithms", "cryptography", "no-std"]
 keywords = [ "crypto", "bitcoin", "hash", "digest" ]
 readme = "README.md"
 edition = "2021"
 rust-version = "1.74.0"
-exclude = ["tests", "contrib"]
+exclude = ["api", "tests", "contrib"]
 
 [features]
 default = ["std"]
-std = ["alloc", "hex?/std"]
-alloc = ["hex?/alloc"]
+std = ["alloc", "hex-stable/std", "hex-unstable/std"]
+alloc = ["hex-stable/alloc", "hex-unstable/alloc"]
 serde = ["dep:serde", "hex"]
+hex = ["dep:hex-stable", "dep:hex-unstable"]
 # Smaller (but slower) implementation of sha256, sha512 and ripemd160
 small-hash = []
 
 [dependencies]
 internals = { package = "bitcoin-internals", path = "../internals", version = "0.5.0" }
-encoding = { package = "bitcoin-consensus-encoding", path = "../consensus_encoding", version = "=1.0.0-rc.3", default-features = false }
+encoding = { package = "bitcoin-consensus-encoding", path = "../consensus_encoding", version = "0.2.0", default-features = false }
 
-hex = { package = "hex-conservative", version = "0.3.0", default-features = false, optional = true }
+arbitrary = { version = "1.4.1", optional = true}
 serde = { version = "1.0.195", default-features = false, optional = true }
+cpufeatures = { version = "0.2", optional = true }
+
+# Both optional hex dependencies are behind the `hex` feature.
+hex-stable = { package = "hex-conservative", version = "1.0.0", default-features = false, optional = true }
+hex-unstable = { package = "hex-conservative", version = "0.3.2", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_test = "1.0.19"
@@ -35,9 +42,28 @@ serde_test = "1.0.19"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.rust]
-unexpected_cfgs = { level = "deny", check-cfg = ['cfg(hashes_fuzz)', 'cfg(rust_v_1_64)' ] }
+[lints]
+workspace = true
 
-[lints.clippy]
-redundant_clone = "warn"
-use_self = "warn"
+[package.metadata.rbmt.api]
+enabled = true
+features = [["alloc"]]
+
+[package.metadata.rbmt.test]
+exact_features = [
+    ["alloc", "serde"],
+    ["alloc", "small-hash"],
+    ["serde", "small-hash"],
+    ["std", "serde"],
+    ["std", "small-hash"],
+    ["alloc", "serde", "small-hash"],
+    ["std", "serde", "small-hash"],
+]
+
+[package.metadata.rbmt.lint]
+allowed_duplicates = [
+    "hex-conservative",
+]
+
+[package.metadata.rbmt.prerelease]
+enabled = true

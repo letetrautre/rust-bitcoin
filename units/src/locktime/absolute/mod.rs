@@ -398,14 +398,9 @@ impl LockTime {
 parse_int::impl_parse_str_from_int_infallible!(LockTime, u32, from_consensus);
 
 #[cfg(feature = "encoding")]
-encoding::encoder_newtype_exact! {
-    /// The encoder for the [`LockTime`] type.
-    pub struct LockTimeEncoder<'e>(encoding::ArrayEncoder<4>);
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Encodable for LockTime {
+impl encoding::Encode for LockTime {
     type Encoder<'e> = LockTimeEncoder<'e>;
+    #[inline]
     fn encoder(&self) -> Self::Encoder<'_> {
         LockTimeEncoder::new(encoding::ArrayEncoder::without_length_prefix(
             self.to_consensus_u32().to_le_bytes(),
@@ -413,45 +408,35 @@ impl encoding::Encodable for LockTime {
     }
 }
 
-/// The decoder for the [`LockTime`] type.
 #[cfg(feature = "encoding")]
-pub struct LockTimeDecoder(encoding::ArrayDecoder<4>);
+impl encoding::Decode for LockTime {
+    type Decoder = LockTimeDecoder;
+
+    #[inline]
+    fn decoder() -> Self::Decoder { LockTimeDecoder(encoding::ArrayDecoder::<4>::new()) }
+}
 
 #[cfg(feature = "encoding")]
-impl LockTimeDecoder {
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`LockTime`] type.
+    #[derive(Debug, Clone)]
+    pub struct LockTimeEncoder<'e>(encoding::ArrayEncoder<4>);
+}
+
+#[cfg(feature = "encoding")]
+crate::decoder_newtype! {
+    /// The decoder for the [`LockTime`] type.
+    #[derive(Debug, Clone)]
+    pub struct LockTimeDecoder(encoding::ArrayDecoder<4>);
+
     /// Constructs a new [`LockTime`] decoder.
     pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
-}
 
-#[cfg(feature = "encoding")]
-impl Default for LockTimeDecoder {
-    fn default() -> Self { Self::new() }
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Decoder for LockTimeDecoder {
-    type Output = LockTime;
-    type Error = LockTimeDecoderError;
-
-    #[inline]
-    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        Ok(self.0.push_bytes(bytes).map_err(LockTimeDecoderError)?)
-    }
-
-    #[inline]
-    fn end(self) -> Result<Self::Output, Self::Error> {
-        let n = u32::from_le_bytes(self.0.end().map_err(LockTimeDecoderError)?);
+    fn end(result: Result<[u8; 4], encoding::UnexpectedEofError>) -> Result<LockTime, LockTimeDecoderError> {
+        let value = result.map_err(LockTimeDecoderError)?;
+        let n = u32::from_le_bytes(value);
         Ok(LockTime::from_consensus(n))
     }
-
-    #[inline]
-    fn read_limit(&self) -> usize { self.0.read_limit() }
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Decodable for LockTime {
-    type Decoder = LockTimeDecoder;
-    fn decoder() -> Self::Decoder { LockTimeDecoder(encoding::ArrayDecoder::<4>::new()) }
 }
 
 impl From<Height> for LockTime {
@@ -492,6 +477,7 @@ impl fmt::Display for LockTime {
 
 #[cfg(feature = "serde")]
 impl serde::Serialize for LockTime {
+    #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -502,6 +488,7 @@ impl serde::Serialize for LockTime {
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for LockTime {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -524,14 +511,29 @@ impl Height {
     /// The maximum absolute block height.
     pub const MAX: Self = Self(LOCK_TIME_THRESHOLD - 1);
 
-    /// Constructs a new [`Height`] from a hex string.
-    ///
-    /// The input string may or may not contain a typical hex prefix e.g., `0x`.
+    /// Constructs a new [`Height`] from a prefixed hex string.
     ///
     /// # Errors
     ///
-    /// If the input string is not a valid hex representation of a block height.
-    pub fn from_hex(s: &str) -> Result<Self, ParseHeightError> { parse_hex(s, Self::from_u32) }
+    /// If the input string is not a valid hex representation of a block height or it does not
+    /// include the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, ParseHeightError> {
+        let height = parse_int::hex_u32_prefixed(s).map_err(ParseError::PrefixedHex)?;
+        Ok(Self::from_u32(height).map_err(|_| ParseError::Conversion(height.into()))?)
+    }
+
+    /// Constructs a new [`Height`] from an unprefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a block height or if it
+    /// includes the `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, ParseHeightError> {
+        let height = parse_int::hex_u32_unprefixed(s).map_err(ParseError::UnprefixedHex)?;
+        Ok(Self::from_u32(height).map_err(|_| ParseError::Conversion(height.into()))?)
+    }
 
     #[deprecated(since = "1.0.0-rc.0", note = "use `from_u32` instead")]
     #[doc(hidden)]
@@ -591,7 +593,10 @@ impl Height {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(Height);
+
 impl fmt::Display for Height {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
@@ -632,18 +637,34 @@ impl MedianTimePast {
     /// locktime: `[500_000_000, 2^32 - 1]`. Because there is a consensus rule that MTP
     /// be monotonically increasing, and the MTP of the first 11 blocks exceeds `500_000_000`
     /// for every real-life chain, this error typically cannot be hit in practice.
+    #[inline]
     pub fn new(timestamps: [crate::BlockTime; 11]) -> Result<Self, ConversionError> {
         crate::BlockMtp::new(timestamps).try_into()
     }
 
-    /// Constructs a new [`MedianTimePast`] from a big-endian hex-encoded `u32`.
-    ///
-    /// The input string may or may not contain a typical hex prefix e.g., `0x`.
+    /// Constructs a new [`MedianTimePast`] from a prefixed hex string.
     ///
     /// # Errors
     ///
-    /// If the input string is not a valid hex representation of a block time.
-    pub fn from_hex(s: &str) -> Result<Self, ParseTimeError> { parse_hex(s, Self::from_u32) }
+    /// If the input string is not a valid hex representation of a block time or it does not
+    /// include the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, ParseTimeError> {
+        let height = parse_int::hex_u32_prefixed(s).map_err(ParseError::PrefixedHex)?;
+        Ok(Self::from_u32(height).map_err(|_| ParseError::Conversion(height.into()))?)
+    }
+
+    /// Constructs a new [`MedianTimePast`] from an unprefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a block time or if it
+    /// includes the `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, ParseTimeError> {
+        let height = parse_int::hex_u32_unprefixed(s).map_err(ParseError::UnprefixedHex)?;
+        Ok(Self::from_u32(height).map_err(|_| ParseError::Conversion(height.into()))?)
+    }
 
     #[deprecated(since = "1.0.0-rc.0", note = "use `from_u32` instead")]
     #[doc(hidden)]
@@ -706,7 +727,10 @@ impl MedianTimePast {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(MedianTimePast);
+
 impl fmt::Display for MedianTimePast {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
@@ -725,22 +749,12 @@ where
     }
 }
 
-fn parse_hex<T, E, S, F>(s: S, f: F) -> Result<T, E>
-where
-    E: From<ParseError>,
-    S: AsRef<str> + Into<InputString>,
-    F: FnOnce(u32) -> Result<T, ConversionError>,
-{
-    let n = i64::from_str_radix(parse_int::hex_remove_optional_prefix(s.as_ref()), 16)
-        .map_err(ParseError::invalid_int(s))?;
-    let n = u32::try_from(n).map_err(|_| ParseError::Conversion(n))?;
-    f(n).map_err(ParseError::from).map_err(Into::into)
-}
-
 /// Returns true if `n` is a block height i.e., less than 500,000,000.
+#[inline]
 pub const fn is_block_height(n: u32) -> bool { n < LOCK_TIME_THRESHOLD }
 
 /// Returns true if `n` is a UNIX timestamp i.e., greater than or equal to 500,000,000.
+#[inline]
 pub const fn is_block_time(n: u32) -> bool { n >= LOCK_TIME_THRESHOLD }
 
 #[cfg(feature = "arbitrary")]
@@ -942,7 +956,7 @@ mod tests {
 
     #[test]
     fn time_from_str_hex_no_prefix_happy_path() {
-        let time = MedianTimePast::from_hex("6289C350").unwrap();
+        let time = MedianTimePast::from_unprefixed_hex("6289C350").unwrap();
         assert_eq!(time, MedianTimePast(0x6289_C350));
     }
 
@@ -962,7 +976,7 @@ mod tests {
 
     #[test]
     fn height_from_str_hex_no_prefix_happy_path() {
-        let height = Height::from_hex("BA70D").unwrap();
+        let height = Height::from_unprefixed_hex("BA70D").unwrap();
         assert_eq!(height, Height(0xBA70D));
     }
 

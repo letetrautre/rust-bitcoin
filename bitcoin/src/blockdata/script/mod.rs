@@ -55,9 +55,6 @@ mod tests;
 pub mod witness_program;
 pub mod witness_version;
 
-use core::convert::Infallible;
-use core::fmt;
-
 use io::{BufRead, Write};
 
 use self::witness_version::WitnessVersion;
@@ -67,7 +64,6 @@ use crate::key::WPubkeyHash;
 use crate::opcodes::all::*;
 use crate::opcodes::Opcode;
 use crate::prelude::Vec;
-use crate::OutPoint;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
@@ -75,18 +71,26 @@ pub use self::{
     borrowed::{ScriptExt, TapScriptExt, ScriptPubKeyExt, WitnessScriptExt, ScriptSigExt},
     builder::Builder,
     instruction::{Instruction, Instructions, InstructionIndices},
-    owned::{ScriptBufExt, ScriptPubKeyBufExt},
-    push_bytes::{PushBytes, PushBytesBuf, PushBytesError, PushBytesErrorReport, ScriptIntError},
+    owned::{ScriptBufExt, ScriptPubKeyBufExt, ScriptSigBufExt},
+    push_bytes::{PushBytes, PushBytesBuf, PushBytesErrorReport},
 };
+#[doc(no_inline)]
+pub use primitives::script::ScriptBufDecoderError;
 #[doc(inline)]
 pub use primitives::script::{
-    RedeemScript, RedeemScriptBuf, RedeemScriptSizeError, RedeemScriptTag, Script, ScriptBuf,
-    ScriptHash, ScriptHashableTag, ScriptPubKey, ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig,
-    ScriptSigBuf, ScriptSigTag, Tag, TapScript, TapScriptBuf, TapScriptTag, WScriptHash,
-    WitnessScript, WitnessScriptBuf, WitnessScriptSizeError, WitnessScriptTag,
+    RedeemScript, RedeemScriptBuf, RedeemScriptTag, Script, ScriptBuf, ScriptBufDecoder,
+    ScriptEncoder, ScriptHash, ScriptHashableTag, ScriptPubKey, ScriptPubKeyBuf, ScriptPubKeyTag,
+    ScriptSig, ScriptSigBuf, ScriptSigTag, SignetBlockScript, SignetBlockScriptBuf,
+    SignetBlockScriptTag, Tag, TapScript, TapScriptBuf, TapScriptTag, WScriptHash, WitnessScript,
+    WitnessScriptBuf, WitnessScriptTag,
 };
 
 pub(crate) use self::borrowed::ScriptExtPriv;
+#[doc(no_inline)]
+pub use self::error::{
+    Error, FromHexError, PushBytesError, RedeemScriptSizeError, ScriptIntError,
+    WitnessScriptSizeError,
+};
 pub(crate) use self::owned::ScriptBufExtPriv;
 
 impl_asref_push_bytes!(ScriptHash, WScriptHash);
@@ -238,52 +242,69 @@ impl<T> Decodable for ScriptBuf<T> {
     }
 }
 
-/// Ways that a script might fail. Not everything is split up as
-/// much as it could be; patches welcome if more detailed errors
-/// would help you.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// Something did a non-minimal push; for more information see
-    /// <https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki#push-operators>
-    NonMinimalPush,
-    /// Some opcode expected a parameter but it was missing or truncated.
-    EarlyEndOfScript,
-    /// Tried to read an array off the stack as a number when it was more than 4 bytes.
-    NumericOverflow,
-    /// Cannot find the spent output.
-    UnknownSpentOutput(OutPoint),
-    /// Cannot serialize the spending transaction.
-    Serialization,
-}
+/// Error types for Bitcoin scripts.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    use crate::OutPoint;
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::NonMinimalPush => f.write_str("non-minimal datapush"),
-            Self::EarlyEndOfScript => f.write_str("unexpected end of script"),
-            Self::NumericOverflow =>
-                f.write_str("numeric overflow (number on stack larger than 4 bytes)"),
-            Self::UnknownSpentOutput(ref point) => write!(f, "unknown spent output: {}", point),
-            Self::Serialization =>
-                f.write_str("can not serialize the spending transaction in Transaction::verify()"),
+    #[rustfmt::skip]        // Keep public re-exports separate.
+    #[doc(inline)]
+    pub use super::push_bytes::{PushBytesError, ScriptIntError};
+    #[doc(no_inline)]
+    pub use primitives::script::error::{
+        FromHexError, RedeemScriptSizeError, ScriptBufDecoderError, WitnessScriptSizeError,
+    };
+
+    /// Ways that a script might fail. Not everything is split up as
+    /// much as it could be; patches welcome if more detailed errors
+    /// would help you.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// Something did a non-minimal push; for more information see
+        /// <https://github.com/bitcoin/bips/blob/master/bip-0062.mediawiki#push-operators>
+        NonMinimalPush,
+        /// Some opcode expected a parameter but it was missing or truncated.
+        EarlyEndOfScript,
+        /// Tried to read an array off the stack as a number when it was more than 4 bytes.
+        NumericOverflow,
+        /// Cannot find the spent output.
+        UnknownSpentOutput(OutPoint),
+        /// Cannot serialize the spending transaction.
+        Serialization,
+    }
+
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::NonMinimalPush => f.write_str("non-minimal datapush"),
+                Self::EarlyEndOfScript => f.write_str("unexpected end of script"),
+                Self::NumericOverflow =>
+                    f.write_str("numeric overflow (number on stack larger than 4 bytes)"),
+                Self::UnknownSpentOutput(ref point) => write!(f, "unknown spent output: {}", point),
+                Self::Serialization => f.write_str(
+                    "can not serialize the spending transaction in Transaction::verify()",
+                ),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::NonMinimalPush
-            | Self::EarlyEndOfScript
-            | Self::NumericOverflow
-            | Self::UnknownSpentOutput(_)
-            | Self::Serialization => None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::NonMinimalPush
+                | Self::EarlyEndOfScript
+                | Self::NumericOverflow
+                | Self::UnknownSpentOutput(_)
+                | Self::Serialization => None,
+            }
         }
     }
 }

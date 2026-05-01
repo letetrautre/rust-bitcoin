@@ -7,16 +7,17 @@
 //!
 //! [BIP-0141]: <https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki>
 
-use core::convert::Infallible;
 use core::fmt;
 use core::str::FromStr;
 
-use internals::write_err;
-
 use crate::opcodes::all::*;
 use crate::opcodes::Opcode;
-use crate::parse_int::{self, ParseIntError};
+use crate::parse_int;
 use crate::script::Instruction;
+
+#[rustfmt::skip]            // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{FromStrError, TryFromInstructionError, TryFromError};
 
 /// Version of the segregated witness program.
 ///
@@ -150,101 +151,121 @@ impl From<WitnessVersion> for Opcode {
     }
 }
 
-/// Error parsing [`WitnessVersion`] from a string.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FromStrError {
-    /// Unable to parse integer from string.
-    Unparsable(ParseIntError),
-    /// String contained an invalid witness version number.
-    Invalid(TryFromError),
-}
+/// Error types for the segwit version number.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl From<Infallible> for FromStrError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    use internals::write_err;
 
-impl fmt::Display for FromStrError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Unparsable(ref e) => write_err!(f, "integer parse error"; e),
-            Self::Invalid(ref e) => write_err!(f, "invalid version number"; e),
+    use crate::parse_int::ParseIntError;
+
+    /// Error parsing [`WitnessVersion`] from a string.
+    ///
+    /// [`WitnessVersion`]: super::WitnessVersion
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum FromStrError {
+        /// Unable to parse integer from string.
+        Unparsable(ParseIntError),
+        /// String contained an invalid witness version number.
+        Invalid(TryFromError),
+    }
+
+    impl From<Infallible> for FromStrError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for FromStrError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::Unparsable(ref e) => write_err!(f, "integer parse error"; e),
+                Self::Invalid(ref e) => write_err!(f, "invalid version number"; e),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for FromStrError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Unparsable(ref e) => Some(e),
-            Self::Invalid(ref e) => Some(e),
+    #[cfg(feature = "std")]
+    impl std::error::Error for FromStrError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Unparsable(ref e) => Some(e),
+                Self::Invalid(ref e) => Some(e),
+            }
         }
     }
-}
 
-impl From<ParseIntError> for FromStrError {
-    fn from(e: ParseIntError) -> Self { Self::Unparsable(e) }
-}
+    impl From<ParseIntError> for FromStrError {
+        fn from(e: ParseIntError) -> Self { Self::Unparsable(e) }
+    }
 
-impl From<TryFromError> for FromStrError {
-    fn from(e: TryFromError) -> Self { Self::Invalid(e) }
-}
+    impl From<TryFromError> for FromStrError {
+        fn from(e: TryFromError) -> Self { Self::Invalid(e) }
+    }
 
-/// Error attempting to create a [`WitnessVersion`] from an [`Instruction`]
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TryFromInstructionError {
-    /// Cannot convert OP to a witness version.
-    TryFrom(TryFromError),
-    /// Cannot create a witness version from non-zero data push.
-    DataPush,
-}
+    /// Error attempting to create a [`WitnessVersion`] from an [`Instruction`]
+    ///
+    /// [`WitnessVersion`]: super::WitnessVersion
+    /// [`Instruction`]: super::Instruction
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum TryFromInstructionError {
+        /// Cannot convert OP to a witness version.
+        TryFrom(TryFromError),
+        /// Cannot create a witness version from non-zero data push.
+        DataPush,
+    }
 
-impl From<Infallible> for TryFromInstructionError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    impl From<Infallible> for TryFromInstructionError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
 
-impl fmt::Display for TryFromInstructionError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::TryFrom(ref e) => write_err!(f, "opcode is not a valid witness version"; e),
-            Self::DataPush => write!(f, "non-zero data push opcode is not a valid witness version"),
+    impl fmt::Display for TryFromInstructionError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::TryFrom(ref e) => write_err!(f, "opcode is not a valid witness version"; e),
+                Self::DataPush =>
+                    write!(f, "non-zero data push opcode is not a valid witness version"),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for TryFromInstructionError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::TryFrom(ref e) => Some(e),
-            Self::DataPush => None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for TryFromInstructionError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::TryFrom(ref e) => Some(e),
+                Self::DataPush => None,
+            }
         }
     }
-}
 
-impl From<TryFromError> for TryFromInstructionError {
-    fn from(e: TryFromError) -> Self { Self::TryFrom(e) }
-}
+    impl From<TryFromError> for TryFromInstructionError {
+        fn from(e: TryFromError) -> Self { Self::TryFrom(e) }
+    }
 
-/// Error attempting to create a [`WitnessVersion`] from an integer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TryFromError {
-    /// The invalid non-witness version integer.
-    invalid: u8,
-}
+    /// Error attempting to create a [`WitnessVersion`] from an integer.
+    ///
+    /// [`WitnessVersion`]: super::WitnessVersion
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct TryFromError {
+        /// The invalid non-witness version integer.
+        pub(super) invalid: u8,
+    }
 
-impl TryFromError {
-    /// Returns the invalid non-witness version integer.
-    pub fn invalid_version(&self) -> u8 { self.invalid }
-}
+    impl TryFromError {
+        /// Returns the invalid non-witness version integer.
+        pub fn invalid_version(&self) -> u8 { self.invalid }
+    }
 
-impl fmt::Display for TryFromError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "invalid witness script version: {}", self.invalid)
+    impl fmt::Display for TryFromError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "invalid witness script version: {}", self.invalid)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for TryFromError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for TryFromError {}

@@ -4,7 +4,6 @@
 //!
 //! This module contains the [`Witness`] struct and related methods to operate on it
 
-use core::convert::Infallible;
 use core::fmt;
 use core::ops::Index;
 
@@ -13,22 +12,40 @@ use arbitrary::{Arbitrary, Unstructured};
 #[cfg(doc)]
 use encoding::Decoder4;
 use encoding::{
-    self, BytesEncoder, CompactSizeDecoder, CompactSizeDecoderError, CompactSizeEncoder, Decoder,
-    Encodable, Encoder, Encoder2,
+    self, BytesEncoder, CompactSizeDecoder, CompactSizeEncoder, Decoder as _, Encoder2,
 };
 #[cfg(feature = "hex")]
 use hex::DecodeVariableLengthBytesError;
 use internals::slice::SliceExt;
 use internals::wrap_debug::WrapDebug;
-use internals::write_err;
 
 use crate::prelude::{Box, Vec};
 #[cfg(doc)]
 use crate::TxIn;
 
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{UnexpectedEofError, WitnessDecoderError};
+
+use self::error::WitnessDecoderErrorInner;
+
 /// Maximum amount of memory (in bytes) to allocate at once when deserializing vectors.
 #[cfg(feature = "alloc")]
 const MAX_VECTOR_ALLOCATE: usize = 1_000_000;
+
+/// Maximum number of items in a witness stack.
+///
+/// This is an anti-DoS limit based on Bitcoin's 4MB block weight limit.
+/// Witness data is part of transactions, which are part of blocks, so witness
+/// items (assuming 1-byte per item) cannot exceed what fits in a block.
+const MAX_WITNESS_STACK_ITEMS: usize = 4_000_000;
+
+/// Maximum byte size of a single witness stack item.
+///
+/// This is an anti-DoS limit based on Bitcoin's 4MB block weight limit.
+/// Witness data is part of transactions, which are part of blocks, so a
+/// single witness item cannot exceed what fits in a block.
+const MAX_WITNESS_ITEM_SIZE: usize = 4_000_000;
 
 /// The Witness is the data used to unlock bitcoin since the [SegWit upgrade].
 ///
@@ -259,9 +276,10 @@ fn decode_cursor(bytes: &[u8], start_of_indices: usize, index: usize) -> Option<
 }
 
 /// The encoder for the [`Witness`] type.
+#[derive(Debug, Clone)]
 pub struct WitnessEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
 
-impl Encodable for Witness {
+impl encoding::Encode for Witness {
     type Encoder<'e>
         = WitnessEncoder<'e>
     where
@@ -276,7 +294,7 @@ impl Encodable for Witness {
     }
 }
 
-impl Encoder for WitnessEncoder<'_> {
+impl encoding::Encoder for WitnessEncoder<'_> {
     #[inline]
     fn current_chunk(&self) -> &[u8] { self.0.current_chunk() }
 
@@ -286,6 +304,7 @@ impl Encoder for WitnessEncoder<'_> {
 
 /// The decoder for the [`Witness`] type.
 #[cfg(feature = "alloc")]
+#[derive(Debug, Clone)]
 pub struct WitnessDecoder {
     /// The single buffer that will become the Witness content.
     /// The index entries are written at the beginning, then rotated in [`Self::end`].
@@ -313,9 +332,9 @@ impl WitnessDecoder {
             content: Vec::new(),
             cursor: 0,
             witness_elements: None,
-            witness_count_decoder: CompactSizeDecoder::new(),
+            witness_count_decoder: CompactSizeDecoder::new_with_limit(MAX_WITNESS_STACK_ITEMS),
             element_idx: 0,
-            element_length_decoder: CompactSizeDecoder::new(),
+            element_length_decoder: CompactSizeDecoder::new_with_limit(MAX_WITNESS_ITEM_SIZE),
             element_bytes_remaining: None,
         }
     }
@@ -347,12 +366,13 @@ impl Default for WitnessDecoder {
     fn default() -> Self { Self::new() }
 }
 
-impl Decoder for WitnessDecoder {
+impl encoding::Decoder for WitnessDecoder {
     type Output = Witness;
     type Error = WitnessDecoderError;
 
     fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        use {WitnessDecoderError as E, WitnessDecoderErrorInner as Inner};
+        use WitnessDecoderError as E;
+        use WitnessDecoderErrorInner as Inner;
 
         // Read initial witness element count.
         if self.witness_elements.is_none() {
@@ -462,7 +482,8 @@ impl Decoder for WitnessDecoder {
     }
 
     fn end(mut self) -> Result<Self::Output, Self::Error> {
-        use {WitnessDecoderError as E, WitnessDecoderErrorInner as Inner};
+        use WitnessDecoderError as E;
+        use WitnessDecoderErrorInner as Inner;
 
         let Some(witness_elements) = self.witness_elements else {
             // Never read the witness element count.
@@ -503,7 +524,7 @@ impl Decoder for WitnessDecoder {
     }
 }
 
-impl encoding::Decodable for Witness {
+impl encoding::Decode for Witness {
     type Decoder = WitnessDecoder;
     fn decoder() -> Self::Decoder { WitnessDecoder::default() }
 }
@@ -660,8 +681,30 @@ impl<'a> IntoIterator for &'a Witness {
 
 impl<T: AsRef<[u8]>> FromIterator<T> for Witness {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let v: Vec<Vec<u8>> = iter.into_iter().map(|item| Vec::from(item.as_ref())).collect();
-        Self::from(v)
+        let mut decoder = WitnessDecoder::new();
+
+        // We can't count the number of witness elements without consuming the iterator.
+        // So instead, we build up the full push_bytes buffer and then push it all at once.
+        // We'll start with a 256 byte buffer to double the initial WitnessDecoder size.
+        let mut buffer = Vec::with_capacity(256);
+        let mut witness_elements = 0;
+
+        // For each witness element, the decoder expects an element length, followed by
+        // the data itself. The iterator's yielded elements do not include the length prefix,
+        // so we add them.
+        for elem in iter {
+            let encoded = crate::compact_size_encode(elem.as_ref().len());
+            buffer.extend_from_slice(encoded.as_slice());
+            buffer.extend_from_slice(elem.as_ref());
+            witness_elements += 1;
+        }
+
+        let witness_count = crate::compact_size_encode(witness_elements);
+        let _ = decoder.push_bytes(&mut witness_count.as_slice());
+
+        let _ = decoder.push_bytes(&mut buffer.as_slice());
+
+        decoder.end().expect("witness_elements in decoder is equal to number of provided elements")
     }
 }
 
@@ -709,30 +752,13 @@ impl<'de> serde::Deserialize<'de> for Witness {
                 self,
                 mut a: A,
             ) -> Result<Self::Value, A::Error> {
-                use hex_unstable::{FromHex, HexToBytesError as E};
-                use serde::de::{self, Unexpected};
-
                 let mut ret = match a.size_hint() {
                     Some(len) => Vec::with_capacity(len),
                     None => Vec::new(),
                 };
 
                 while let Some(elem) = a.next_element::<String>()? {
-                    let vec = Vec::<u8>::from_hex(&elem).map_err(|e| match e {
-                        E::InvalidChar(ref e) =>
-                            match core::char::from_u32(e.invalid_char().into()) {
-                                Some(c) => de::Error::invalid_value(
-                                    Unexpected::Char(c),
-                                    &"a valid hex character",
-                                ),
-                                None => de::Error::invalid_value(
-                                    Unexpected::Unsigned(e.invalid_char().into()),
-                                    &"a valid hex character",
-                                ),
-                            },
-                        E::OddLengthString(ref e) =>
-                            de::Error::invalid_length(e.length(), &"an even length string"),
-                    })?;
+                    let vec = hex::decode_to_vec(&elem).map_err(serde::de::Error::custom)?;
                     ret.push(vec);
                 }
                 Ok(Witness::from_slice(&ret))
@@ -812,61 +838,6 @@ impl Default for Witness {
     #[inline]
     fn default() -> Self { Self::new() }
 }
-
-/// An error when consensus decoding a [`Witness`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WitnessDecoderError(WitnessDecoderErrorInner);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum WitnessDecoderErrorInner {
-    /// Error decoding the vector length prefix.
-    LengthPrefixDecode(CompactSizeDecoderError),
-    /// Not enough bytes given to decoder.
-    UnexpectedEof(UnexpectedEofError),
-}
-
-impl From<Infallible> for WitnessDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for WitnessDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use WitnessDecoderErrorInner as E;
-
-        match self.0 {
-            E::LengthPrefixDecode(ref e) => write_err!(f, "vec decoder error"; e),
-            E::UnexpectedEof(ref e) => write_err!(f, "decoder error"; e),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for WitnessDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use WitnessDecoderErrorInner as E;
-
-        match self.0 {
-            E::LengthPrefixDecode(ref e) => Some(e),
-            E::UnexpectedEof(ref e) => Some(e),
-        }
-    }
-}
-
-/// Not enough witness elements (bytes) given to decoder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnexpectedEofError {
-    /// Number of elements missing to complete decoder.
-    missing_elements: usize,
-}
-
-impl core::fmt::Display for UnexpectedEofError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "not enough witness elements for decoder, missing {}", self.missing_elements)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for UnexpectedEofError {}
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for Witness {
@@ -955,6 +926,78 @@ fn decode_unchecked(slice: &mut &[u8]) -> u64 {
     }
 }
 
+/// Error types for witness data.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use encoding::CompactSizeDecoderError;
+    use internals::write_err;
+
+    /// An error when consensus decoding a [`Witness`].
+    ///
+    /// [`Witness`]: super::Witness
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct WitnessDecoderError(pub(super) WitnessDecoderErrorInner);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum WitnessDecoderErrorInner {
+        /// Error decoding the vector length prefix.
+        LengthPrefixDecode(CompactSizeDecoderError),
+        /// Not enough bytes given to decoder.
+        UnexpectedEof(UnexpectedEofError),
+    }
+
+    impl From<Infallible> for WitnessDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for WitnessDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            use WitnessDecoderErrorInner as E;
+
+            match self.0 {
+                E::LengthPrefixDecode(ref e) => write_err!(f, "vec decoder error"; e),
+                E::UnexpectedEof(ref e) => write_err!(f, "decoder error"; e),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for WitnessDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            use WitnessDecoderErrorInner as E;
+
+            match self.0 {
+                E::LengthPrefixDecode(ref e) => Some(e),
+                E::UnexpectedEof(ref e) => Some(e),
+            }
+        }
+    }
+
+    /// Not enough witness elements (bytes) given to decoder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct UnexpectedEofError {
+        /// Number of elements missing to complete decoder.
+        pub(super) missing_elements: usize,
+    }
+
+    impl From<Infallible> for UnexpectedEofError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for UnexpectedEofError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "not enough witness elements for decoder, missing {}", self.missing_elements)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for UnexpectedEofError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
+}
+
 #[cfg(test)]
 mod test {
     #[cfg(feature = "alloc")]
@@ -965,7 +1008,10 @@ mod test {
     use std::error::Error as _;
 
     #[cfg(feature = "alloc")]
-    use encoding::Decodable as _;
+    use encoding::Decode as _;
+    #[cfg(feature = "alloc")]
+    use encoding::Encode as _;
+    use encoding::Encoder as _;
 
     use super::*;
 
@@ -1335,7 +1381,6 @@ mod test {
         // We don't encode one element at a time, rather we encode the whole content slice at once.
         assert_eq!(encoder.current_chunk(), &[3u8, 1, 2, 3, 2, 4, 5][..]);
         assert!(!encoder.advance());
-        assert!(encoder.current_chunk().is_empty());
     }
 
     #[test]

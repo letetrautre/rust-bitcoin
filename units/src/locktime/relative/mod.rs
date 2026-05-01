@@ -14,15 +14,17 @@ use core::{convert, fmt};
 use arbitrary::{Arbitrary, Unstructured};
 use internals::const_casts;
 
+use crate::parse_int::{self, PrefixedHexError, UnprefixedHexError};
 #[cfg(doc)]
 use crate::relative;
-use crate::{parse_int, BlockHeight, BlockMtp, Sequence};
+use crate::{BlockHeight, BlockMtp, Sequence};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(no_inline)]
 pub use self::error::{
-    DisabledLockTimeError, InvalidHeightError, InvalidTimeError, IsSatisfiedByError,
-    IsSatisfiedByHeightError, IsSatisfiedByTimeError, TimeOverflowError,
+    DisabledLockTimeError, IncompatibleHeightError, IncompatibleTimeError, InvalidHeightError,
+    InvalidTimeError, IsSatisfiedByError, IsSatisfiedByHeightError, IsSatisfiedByTimeError,
+    TimeOverflowError,
 };
 
 /// A relative lock time value, representing either a block height or time (512 second intervals).
@@ -199,6 +201,7 @@ impl LockTime {
     /// # Errors
     ///
     /// If `chain_tip` as not _after_ `utxo_mined_at` i.e., if you get the args mixed up.
+    #[inline]
     pub fn is_satisfied_by(
         self,
         chain_tip_height: BlockHeight,
@@ -234,7 +237,8 @@ impl LockTime {
             Self::Blocks(blocks) => blocks
                 .is_satisfied_by(chain_tip, utxo_mined_at)
                 .map_err(IsSatisfiedByHeightError::Satisfaction),
-            Self::Time(time) => Err(IsSatisfiedByHeightError::Incompatible(time)),
+            Self::Time(time) =>
+                Err(IsSatisfiedByHeightError::Incompatible(IncompatibleHeightError(time))),
         }
     }
 
@@ -256,7 +260,8 @@ impl LockTime {
             Self::Time(time) => time
                 .is_satisfied_by(chain_tip, utxo_mined_at)
                 .map_err(IsSatisfiedByTimeError::Satisfaction),
-            Self::Blocks(blocks) => Err(IsSatisfiedByTimeError::Incompatible(blocks)),
+            Self::Blocks(blocks) =>
+                Err(IsSatisfiedByTimeError::Incompatible(IncompatibleTimeError(blocks))),
         }
     }
 
@@ -367,6 +372,7 @@ impl From<LockTime> for Sequence {
 
 #[cfg(feature = "serde")]
 impl serde::Serialize for LockTime {
+    #[inline]
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -377,6 +383,7 @@ impl serde::Serialize for LockTime {
 
 #[cfg(feature = "serde")]
 impl<'de> serde::Deserialize<'de> for LockTime {
+    #[inline]
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -430,6 +437,30 @@ impl NumberOfBlocks {
         self.0 as u32 // cast safety: u32 is wider than u16 on all architectures
     }
 
+    /// Constructs a new `NumberOfBlocks` from a prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a block count or it does not
+    /// include the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+        let block_count = parse_int::hex_u16_prefixed(s)?;
+        Ok(Self::from_height(block_count))
+    }
+
+    /// Constructs a new `NumberOfBlocks` from an unprefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a block count or if it includes
+    /// the `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+        let block_count = parse_int::hex_u16_unprefixed(s)?;
+        Ok(Self::from_height(block_count))
+    }
+
     /// Returns true if an output locked by height can be spent in the next block.
     ///
     /// # Errors
@@ -454,6 +485,8 @@ impl NumberOfBlocks {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(NumberOfBlocks);
+
 impl From<u16> for NumberOfBlocks {
     #[inline]
     fn from(value: u16) -> Self { Self(value) }
@@ -462,6 +495,7 @@ impl From<u16> for NumberOfBlocks {
 parse_int::impl_parse_str_from_int_infallible!(NumberOfBlocks, u16, from);
 
 impl fmt::Display for NumberOfBlocks {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
@@ -552,6 +586,30 @@ impl NumberOf512Seconds {
         (1u32 << 22) | self.0 as u32 // cast safety: u32 is wider than u16 on all architectures
     }
 
+    /// Constructs a new `NumberOf512Seconds` from a prefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a number of 512 second intervals
+    /// or it does not include the `0x` prefix.
+    #[inline]
+    pub fn from_hex(s: &str) -> Result<Self, PrefixedHexError> {
+        let block_count = parse_int::hex_u16_prefixed(s)?;
+        Ok(Self::from_512_second_intervals(block_count))
+    }
+
+    /// Constructs a new `NumberOf512Seconds` from an unprefixed hex string.
+    ///
+    /// # Errors
+    ///
+    /// If the input string is not a valid hex representation of a number of 512 second intervals
+    /// or if it includes the `0x` prefix.
+    #[inline]
+    pub fn from_unprefixed_hex(s: &str) -> Result<Self, UnprefixedHexError> {
+        let block_count = parse_int::hex_u16_unprefixed(s)?;
+        Ok(Self::from_512_second_intervals(block_count))
+    }
+
     /// Returns true if an output locked by time can be spent in the next block.
     ///
     /// # Errors
@@ -573,9 +631,12 @@ impl NumberOf512Seconds {
     }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(NumberOf512Seconds);
+
 parse_int::impl_parse_str_from_int_infallible!(NumberOf512Seconds, u16, from_512_second_intervals);
 
 impl fmt::Display for NumberOf512Seconds {
+    #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
@@ -780,7 +841,10 @@ mod tests {
         let err = lock_by_time.is_satisfied_by_height(chain_tip, mined_at).unwrap_err();
 
         let expected_time = NumberOf512Seconds::from_512_second_intervals(70);
-        assert_eq!(err, IsSatisfiedByHeightError::Incompatible(expected_time));
+        assert_eq!(
+            err,
+            IsSatisfiedByHeightError::Incompatible(IncompatibleHeightError(expected_time))
+        );
         assert!(!format!("{}", err).is_empty());
     }
 
@@ -808,7 +872,10 @@ mod tests {
         let err = lock_by_height.is_satisfied_by_time(chain_tip, mined_at).unwrap_err();
 
         let expected_height = NumberOfBlocks::from(10);
-        assert_eq!(err, IsSatisfiedByTimeError::Incompatible(expected_height));
+        assert_eq!(
+            err,
+            IsSatisfiedByTimeError::Incompatible(IncompatibleTimeError(expected_height))
+        );
         assert!(!format!("{}", err).is_empty());
     }
 

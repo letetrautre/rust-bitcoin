@@ -5,9 +5,10 @@
 use crate::sha512;
 
 crate::internal_macros::general_hash_type! {
-    384,
-    false,
-    "Output of the SHA384 hash function."
+    /// Output of the SHA384 hash function.
+    pub struct Hash([u8; 48]);
+
+    const DISPLAY_BACKWARD: bool = false;
 }
 
 impl Hash {

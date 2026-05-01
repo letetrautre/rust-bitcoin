@@ -349,6 +349,17 @@ See [Errors](#errors) section.
   compatible. These configuration conditionals are set at build time in `bitcoin/build.rs`. New
   version attributes may be added as needed.
 
+- Use stacked attributes over `#[cfg(all(...))]` when a simple conjunction applies to the same item.
+
+    Good:
+    ```rust
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    ```
+    Bad:
+    ```rust
+    #[cfg(all(feature = "alloc", feature = "hex"))]
+    ```
 
 ## BIP References
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! SHA256t implementation (tagged SHA256).
+//! `SHA256t` implementation (tagged SHA256).
 
 use core::cmp;
 use core::marker::PhantomData;
@@ -37,14 +37,15 @@ where
     engine.finalize()
 }
 
-/// Trait representing a tag that can be used as a context for SHA256t hashes.
+/// Trait representing a tag that can be used as a context for `SHA256t` hashes.
 pub trait Tag {
     /// The [`Midstate`] after pre-tagging the hash engine.
     const MIDSTATE: sha256::Midstate;
 }
 
-internals::transparent_newtype! {
-    /// Output of the SHA256t hash function.
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
+    /// Output of the `SHA256t` hash function.
     pub struct Hash<T>(PhantomData<T>, [u8; 32]);
 
     impl<T> Hash<T> {
@@ -127,13 +128,13 @@ impl<T: Tag> core::hash::Hash for Hash<T> {
 
 crate::internal_macros::hash_trait_impls!(256, false, T: Tag);
 
-/// Engine to compute SHA256t hash function.
+/// Engine to compute `SHA256t` hash function.
 #[derive(Debug)]
 pub struct HashEngine<T>(sha256::HashEngine, PhantomData<T>);
 
 impl<T: Tag> Default for HashEngine<T> {
     fn default() -> Self {
-        let tagged = sha256::HashEngine::from_midstate(T::MIDSTATE);
+        let tagged = T::MIDSTATE.to_engine();
         Self(tagged, PhantomData)
     }
 }

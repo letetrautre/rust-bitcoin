@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! ChaCha20 - Poly1305
+//! # `ChaCha20` - `Poly1305`
 //!
-//! Combine the ChaCha20 stream cipher with the Poly1305 message authentication code
+//! Combine the `ChaCha20` stream cipher with the `Poly1305` message authentication code
 //! to form an authenticated encryption with additional data (AEAD) algorithm.
 
 #![no_std]
@@ -11,9 +11,8 @@
 #![warn(deprecated_in_future)]
 #![doc(test(attr(warn(unused))))]
 // Exclude lints we don't think are valuable.
-#![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
-#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
-#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)` instead of enforcing `format!("{x}")`
+#![allow(clippy::inline_always)] // Not sure yet if we should give up the inline always, possible that the LLVM knows better.
+#![cfg_attr(chacha20_poly1305_fuzz, allow(dead_code, unused_imports))]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
@@ -23,51 +22,28 @@ extern crate std;
 pub mod chacha20;
 pub mod poly1305;
 
-use core::fmt;
-
 use chacha20::ChaCha20;
 use poly1305::Poly1305;
 
 pub use self::chacha20::{Key, Nonce};
+#[doc(no_inline)]
+pub use self::error::Error;
 
 /// Zero array for padding slices.
 const ZEROES: [u8; 16] = [0u8; 16];
 
-/// Errors encrypting and decrypting messages with ChaCha20 and Poly1305 authentication tags.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    /// Additional data showing up when it is not expected.
-    UnauthenticatedAdditionalData,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnauthenticatedAdditionalData => write!(f, "Unauthenticated aad."),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UnauthenticatedAdditionalData => None,
-        }
-    }
-}
-
 /// Encrypt and decrypt content along with an authentication tag.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ChaCha20Poly1305 {
     key: Key,
     nonce: Nonce,
 }
 
 impl ChaCha20Poly1305 {
-    /// Make a new instance of a ChaCha20Poly1305 AEAD.
+    /// Make a new instance of a `ChaCha20Poly1305` AEAD.
     pub const fn new(key: Key, nonce: Nonce) -> Self { Self { key, nonce } }
 
-    /// Encrypt content in place and return the Poly1305 16-byte authentication tag.
+    /// Encrypt content in place and return the `Poly1305` 16-byte authentication tag.
     ///
     /// # Parameters
     ///
@@ -80,9 +56,16 @@ impl ChaCha20Poly1305 {
     pub fn encrypt(self, content: &mut [u8], aad: Option<&[u8]>) -> [u8; 16] {
         let mut chacha = ChaCha20::new_from_block(self.key, self.nonce, 1);
         chacha.apply_keystream(content);
-        let keystream = chacha.get_keystream(0);
-        let mut poly =
-            Poly1305::new(keystream[..32].try_into().expect("slicing produces 32-byte slice"));
+        #[cfg(not(chacha20_poly1305_fuzz))]
+        let poly_key = {
+            let keystream = chacha.get_keystream(0);
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&keystream[..32]);
+            k
+        };
+        #[cfg(chacha20_poly1305_fuzz)]
+        let poly_key = self.key.0;
+        let mut poly = Poly1305::new(poly_key);
         let aad = aad.unwrap_or(&[]);
         // AAD and ciphertext are padded if not 16-byte aligned.
         poly.input(aad);
@@ -109,16 +92,28 @@ impl ChaCha20Poly1305 {
     /// - `content` - Ciphertext to be decrypted in place.
     /// - `tag`     - 16-byte authentication tag.
     /// - `aad`     - Optional metadata covered by the authentication tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnauthenticatedAdditionalData`] if the computed authentication tag does
+    /// not match the provided tag.
     pub fn decrypt(
         self,
         content: &mut [u8],
         tag: [u8; 16],
         aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        let chacha = ChaCha20::new_from_block(self.key, self.nonce, 0);
-        let keystream = chacha.get_keystream(0);
-        let mut poly =
-            Poly1305::new(keystream[..32].try_into().expect("slicing produces 32-byte slice"));
+        #[cfg(not(chacha20_poly1305_fuzz))]
+        let poly_key = {
+            let chacha = ChaCha20::new_from_block(self.key, self.nonce, 0);
+            let keystream = chacha.get_keystream(0);
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&keystream[..32]);
+            k
+        };
+        #[cfg(chacha20_poly1305_fuzz)]
+        let poly_key = self.key.0;
+        let mut poly = Poly1305::new(poly_key);
         let aad = aad.unwrap_or(&[]);
         poly.input(aad);
         // AAD and ciphertext are padded if not 16-byte aligned.
@@ -157,6 +152,35 @@ fn encode_lengths(aad_len: u64, content_len: u64) -> [u8; 16] {
     len_buffer
 }
 
+/// Error types for the `ChaCha20Poly1305` AEAD.
+pub mod error {
+    use core::fmt;
+
+    /// Errors encrypting and decrypting messages with `ChaCha20` and `Poly1305` authentication tags.
+    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+    pub enum Error {
+        /// Additional data showing up when it is not expected.
+        UnauthenticatedAdditionalData,
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::UnauthenticatedAdditionalData => write!(f, "Unauthenticated aad."),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::UnauthenticatedAdditionalData => None,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "alloc")]
 mod tests {
@@ -166,6 +190,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(not(chacha20_poly1305_fuzz))]
     #[test]
     fn rfc7539() {
         let mut message = *b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";

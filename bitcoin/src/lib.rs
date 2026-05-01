@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin Library
+//! # Rust Bitcoin Library
 //!
 //! This is a library that supports the Bitcoin network protocol and associated primitives. It is
 //! designed for Rust programs built to work with the Bitcoin network.
@@ -13,6 +13,7 @@
 //!
 //! # Cargo features
 //!
+//! * `arbitrary` (dependency) - arbitrary type implementations for testing.
 //! * `base64` (dependency) - enables encoding of PSBTs and message signatures.
 //! * `bitcoinconsensus` (dependency) - enables validating scripts and transactions.
 //! * `default` - enables `std` and `secp-recovery`.
@@ -22,7 +23,7 @@
 //! * `secp-recovery` - enables calculating public key from a signature and message.
 //! * `std` - the usual dependency on `std`.
 
-#![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
+#![no_std]
 // Experimental features we need.
 #![cfg_attr(docsrs, feature(doc_notable_trait))]
 // Coding conventions.
@@ -55,39 +56,30 @@ internals::const_assert!(
 #[macro_use]
 extern crate alloc;
 
-/// Encodes and decodes base64 as bytes or utf8.
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "arbitrary")]
+pub extern crate arbitrary;
+
+pub extern crate base58;
 #[cfg(feature = "base64")]
 pub extern crate base64;
-
-/// Bitcoin base58 encoding and decoding.
-pub extern crate base58;
-
-/// Re-export the `bech32` crate.
 pub extern crate bech32;
-
-/// Rust implementation of cryptographic hash function algorithms.
+pub extern crate encoding;
 pub extern crate hashes;
-
-/// Re-export the `hex-conservative` crate.
-pub extern crate hex;
-
-/// Re-export the `bitcoin-io` crate.
+pub extern crate hex_stable as hex;
 pub extern crate io;
-
-/// Re-export the `primitives` crate.
 pub extern crate primitives;
-
-/// Re-export the `rust-secp256k1` crate.
-///
-/// Rust wrapper library for Pieter Wuille's libsecp256k1. Implements ECDSA and BIP-0340 signatures
-/// for the SECG elliptic curve group secp256k1 and related utilities.
 pub extern crate secp256k1;
 
 #[cfg(feature = "serde")]
 #[macro_use]
-extern crate serde;
+pub extern crate serde;
 
 mod internal_macros;
+
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
 
 pub mod ext {
     //! Re-export all the extension traits so downstream can use wildcard imports.
@@ -109,15 +101,19 @@ pub mod ext {
     #[rustfmt::skip] // Use terse custom grouping.
     pub use crate::{
         block::{BlockCheckedExt as _, HeaderExt as _},
-        pow::CompactTargetExt as _,
+        key::{FullPublicKeyExt as _, LegacyPublicKeyExt as _},
+        network::NetworkExt as _,
+        pow::{CompactTargetExt as _, TargetExt as _, WorkExt as _},
         script::{ScriptExt as _, ScriptBufExt as _, TapScriptExt as _, ScriptPubKeyExt as _, ScriptPubKeyBufExt as _, WitnessScriptExt as _, ScriptSigExt as _},
+        taproot::{TapLeafHashExt as _, TapNodeHashExt as _},
         transaction::{TxidExt as _, WtxidExt as _, OutPointExt as _, TxInExt as _, TxOutExt as _, TransactionExt as _},
         witness::WitnessExt as _,
     };
     #[cfg(feature = "bitcoinconsensus")]
     pub use crate::consensus_validation::{ScriptPubKeyExt as _, TransactionExt as _};
+    #[cfg(feature = "secp-recovery")]
+    pub use crate::key::PrivateKeyExt as _;
 }
-#[macro_use]
 pub mod address;
 pub mod bip158;
 pub mod bip32;
@@ -132,12 +128,14 @@ pub mod merkle_tree;
 pub mod network;
 pub mod policy;
 pub mod pow;
-pub mod psbt;
 pub mod sign_message;
 pub mod taproot;
 
 // Re-export the type from where it is defined but the module from the highest place up the stack
 // that it is available in the event that we add some functionality there.
+#[doc(inline)]
+#[cfg(feature = "serde")]
+pub use primitives::serde_as_consensus;
 #[doc(inline)]
 pub use primitives::{
     block::{
@@ -146,15 +144,13 @@ pub use primitives::{
         Validation as BlockValidation, Version as BlockVersion, WitnessCommitment,
     },
     merkle_tree::{TxMerkleNode, WitnessMerkleNode},
-    pow::CompactTarget, // No `pow` module outside of `primitives`.
     script::{
         RedeemScript, RedeemScriptBuf, RedeemScriptTag, ScriptHashableTag, ScriptPubKey,
-        ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig, ScriptSigBuf, ScriptSigTag, Tag, TapScript,
-        TapScriptBuf, TapScriptTag, WitnessScript, WitnessScriptBuf, WitnessScriptTag,
+        ScriptPubKeyBuf, ScriptPubKeyTag, ScriptSig, ScriptSigBuf, ScriptSigTag, SignetBlockScript,
+        SignetBlockScriptBuf, SignetBlockScriptTag, Tag, TapScript, TapScriptBuf, TapScriptTag,
+        WitnessScript, WitnessScriptBuf, WitnessScriptTag,
     },
-    transaction::{
-        Ntxid, OutPoint, Transaction, TxIn, TxOut, Txid, Version as TransactionVersion, Wtxid,
-    },
+    transaction::{OutPoint, Transaction, TxIn, TxOut, Txid, Version as TransactionVersion, Wtxid},
     witness::Witness,
 };
 #[doc(inline)]
@@ -163,6 +159,7 @@ pub use units::{
     block::{BlockHeight, BlockHeightInterval, BlockMtp, BlockMtpInterval},
     fee_rate::FeeRate,
     parse_int,
+    pow::CompactTarget,
     result::{self, NumOpResult},
     sequence::{self, Sequence},
     time::{self, BlockTime, BlockTimeDecoder, BlockTimeDecoderError},
@@ -173,17 +170,26 @@ pub use units::{
 #[doc(hidden)]
 pub type BlockInterval = BlockHeightInterval;
 
+#[deprecated(since = "TBD", note = "use `FullPublicKey` instead")]
+#[doc(hidden)]
+pub type CompressedPublicKey = FullPublicKey;
+
+#[deprecated(since = "TBD", note = "use `LegacyPublicKey` instead")]
+#[doc(hidden)]
+pub type PublicKey = LegacyPublicKey;
+
 #[doc(inline)]
 pub use crate::{
     address::{Address, AddressType, KnownHrp},
     bip32::XKeyIdentifier,
     crypto::ecdsa,
-    crypto::key::{self, CompressedPublicKey, Keypair, PrivateKey, PublicKey, XOnlyPublicKey},
+    crypto::key::{
+        self, FullPublicKey, Keypair, LegacyPublicKey, PrivateKey, WifKey, XOnlyPublicKey,
+    },
     crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
     network::params::{self, Params},
     network::{Network, NetworkKind, TestnetVersion},
     pow::{Target, Work},
-    psbt::Psbt,
     sighash::{EcdsaSighashType, TapSighashType},
     taproot::{TapBranchTag, TapLeafHash, TapLeafTag, TapNodeHash, TapTweakHash, TapTweakTag},
 };
@@ -202,24 +208,25 @@ pub use crate::{
 #[rustfmt::skip]
 #[allow(unused_imports)]
 mod prelude {
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, slice, rc};
 
-    #[cfg(all(not(feature = "std"), not(test), target_has_atomic = "ptr"))]
+    #[cfg(target_has_atomic = "ptr")]
+    #[cfg(not(feature = "std"))]
     pub use alloc::sync;
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::{Borrow, BorrowMut, Cow, ToOwned}, rc, sync};
 
-    #[cfg(all(not(feature = "std"), not(test)))]
+    #[cfg(not(feature = "std"))]
     pub use alloc::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
-    #[cfg(any(feature = "std", test))]
+    #[cfg(feature = "std")]
     pub use std::collections::{BTreeMap, BTreeSet, btree_map, BinaryHeap};
 
     pub use crate::io::sink;
 
-    pub use hex::DisplayHex;
+    pub use hex_unstable::DisplayHex;
 }
 
 pub mod amount {
@@ -235,20 +242,25 @@ pub mod amount {
     #[cfg(feature = "serde")]
     pub use units::amount::serde;
     #[doc(inline)]
-    pub use units::amount::{Amount, SignedAmount};
+    pub use units::amount::{Amount, AmountDecoder, AmountEncoder, SignedAmount};
     #[doc(no_inline)]
-    pub use units::amount::{
-        Denomination, Display, OutOfRangeError, ParseAmountError, ParseDenominationError,
-        ParseError,
+    pub use units::amount::{Denomination, Display};
+
+    #[doc(no_inline)]
+    pub use self::error::{
+        AmountDecoderError, BadPositionError, InputTooLargeError, InvalidCharacterError,
+        MissingDenominationError, MissingDigitsError, OutOfRangeError, ParseAmountError,
+        ParseDenominationError, ParseError, PossiblyConfusingDenominationError, TooPreciseError,
+        UnknownDenominationError,
     };
 
     /// Error types for bitcoin amounts.
     pub mod error {
         pub use units::amount::error::{
-            InputTooLargeError, InvalidCharacterError, MissingDenominationError,
-            MissingDigitsError, OutOfRangeError, ParseAmountError, ParseDenominationError,
-            ParseError, PossiblyConfusingDenominationError, TooPreciseError,
-            UnknownDenominationError,
+            AmountDecoderError, BadPositionError, InputTooLargeError, InvalidCharacterError,
+            MissingDenominationError, MissingDigitsError, OutOfRangeError, ParseAmountError,
+            ParseDenominationError, ParseError, PossiblyConfusingDenominationError,
+            TooPreciseError, UnknownDenominationError,
         };
     }
 

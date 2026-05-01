@@ -7,16 +7,17 @@
 //!
 //! [BIP-0141]: <https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki>
 
-use core::convert::Infallible;
-use core::fmt;
-
 use internals::array_vec::ArrayVec;
 
 use super::witness_version::WitnessVersion;
 use super::{PushBytes, WScriptHash, WitnessScript, WitnessScriptSizeError};
-use crate::crypto::key::{CompressedPublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey};
+use crate::crypto::key::{FullPublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey};
 use crate::script::WitnessScriptExt as _;
 use crate::taproot::TapNodeHash;
+
+#[rustfmt::skip]            // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::Error;
 
 /// The minimum byte size of a segregated witness program.
 pub const MIN_SIZE: usize = 2;
@@ -73,7 +74,7 @@ impl WitnessProgram {
     }
 
     /// Constructs a new [`WitnessProgram`] from `pk` for a P2WPKH output.
-    pub fn p2wpkh(pk: CompressedPublicKey) -> Self {
+    pub fn p2wpkh(pk: FullPublicKey) -> Self {
         let hash = pk.wpubkey_hash();
         Self::new_p2wpkh(hash.to_byte_array())
     }
@@ -95,14 +96,14 @@ impl WitnessProgram {
         merkle_root: Option<TapNodeHash>,
     ) -> Self {
         let internal_key = internal_key.into();
-        let (output_key, _parity) = internal_key.tap_tweak(merkle_root);
-        let pubkey = output_key.as_x_only_public_key().serialize();
+        let output_key = internal_key.tap_tweak(merkle_root);
+        let (pubkey, _) = output_key.as_x_only_public_key().serialize();
         Self::new_p2tr(pubkey)
     }
 
     /// Constructs a new [`WitnessProgram`] from a tweaked key for a P2TR output.
     pub fn p2tr_tweaked(output_key: TweakedPublicKey) -> Self {
-        let pubkey = output_key.as_x_only_public_key().serialize();
+        let (pubkey, _) = output_key.as_x_only_public_key().serialize();
         Self::new_p2tr(pubkey)
     }
 
@@ -141,36 +142,42 @@ impl WitnessProgram {
     }
 }
 
-/// Witness program error.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// The witness program must be between 2 and 40 bytes in length.
-    InvalidLength(usize),
-    /// A v0 witness program must be either of length 20 or 32.
-    InvalidSegwitV0Length(usize),
-}
+/// Error types for witness programs.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+    /// Witness program error.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// The witness program must be between 2 and 40 bytes in length.
+        InvalidLength(usize),
+        /// A v0 witness program must be either of length 20 or 32.
+        InvalidSegwitV0Length(usize),
+    }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::InvalidLength(len) =>
-                write!(f, "witness program must be between 2 and 40 bytes: length={}", len),
-            Self::InvalidSegwitV0Length(len) =>
-                write!(f, "a v0 witness program must be either 20 or 32 bytes: length={}", len),
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::InvalidLength(len) =>
+                    write!(f, "witness program must be between 2 and 40 bytes: length={}", len),
+                Self::InvalidSegwitV0Length(len) =>
+                    write!(f, "a v0 witness program must be either 20 or 32 bytes: length={}", len),
+            }
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidLength(_) | Self::InvalidSegwitV0Length(_) => None,
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidLength(_) | Self::InvalidSegwitV0Length(_) => None,
+            }
         }
     }
 }

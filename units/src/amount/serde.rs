@@ -46,8 +46,8 @@ impl fmt::Display for DisplayFullError {
     }
 }
 
-#[cfg(not(feature = "std"))]
 #[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 impl fmt::Display for DisplayFullError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
@@ -64,6 +64,7 @@ pub mod as_sat {
 
     use crate::SignedAmount;
 
+    #[inline]
     pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
     where
         A: Into<SignedAmount> + Copy,
@@ -72,6 +73,7 @@ pub mod as_sat {
         i64::serialize(&amount.to_sat(), s)
     }
 
+    #[inline]
     pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
     where
         A: TryFrom<SignedAmount>,
@@ -96,6 +98,7 @@ pub mod as_sat {
 
         use crate::SignedAmount;
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
         where
@@ -128,6 +131,7 @@ pub mod as_sat {
                     write!(formatter, "an Option<i64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -135,6 +139,7 @@ pub mod as_sat {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -143,6 +148,73 @@ pub mod as_sat {
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    pub mod vec {
+        //! Serialize and deserialize `Vec<Amount>` and `Vec<SignedAmount>` as real numbers
+        //! denominated in satoshi.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_sat::vec")]`.
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::ser::SerializeSeq;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::SignedAmount;
+
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: Into<SignedAmount> + Copy,
+        {
+            let mut seq = s.serialize_seq(Some(a.len()))?;
+            for amount in a {
+                let signed_amount: SignedAmount = (*amount).into();
+                seq.serialize_element(&signed_amount.to_sat())?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: TryFrom<SignedAmount>,
+            <A as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+        {
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: TryFrom<SignedAmount>,
+                <X as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of i64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] SignedAmount);
+
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(X::try_from(wrapped.0).map_err(de::Error::custom)?);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }
@@ -161,6 +233,7 @@ pub mod as_btc {
     use super::DisplayFullError;
     use crate::amount::{Denomination, SignedAmount};
 
+    #[inline]
     pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
     where
         A: Into<SignedAmount> + Copy,
@@ -169,6 +242,7 @@ pub mod as_btc {
         f64::serialize(&amount.to_float_in(Denomination::Bitcoin), s)
     }
 
+    #[inline]
     pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
     where
         A: TryFrom<SignedAmount>,
@@ -195,6 +269,7 @@ pub mod as_btc {
 
         use crate::amount::{Denomination, SignedAmount};
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
         where
@@ -227,6 +302,7 @@ pub mod as_btc {
                     write!(formatter, "an Option<f64>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -234,6 +310,7 @@ pub mod as_btc {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -242,6 +319,72 @@ pub mod as_btc {
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    pub mod vec {
+        //! Serialize and deserialize `Vec<Amount>` and `Vec<SignedAmount>` as JSON numbers
+        //! denominated in BTC.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_btc::vec")]`.
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::ser::SerializeSeq;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::amount::{Denomination, SignedAmount};
+
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: Into<SignedAmount> + Copy,
+        {
+            let mut seq = s.serialize_seq(Some(a.len()))?;
+            for amount in a {
+                let signed_amount: SignedAmount = (*amount).into();
+                seq.serialize_element(&signed_amount.to_float_in(Denomination::Bitcoin))?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: TryFrom<SignedAmount>,
+            <A as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+        {
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: TryFrom<SignedAmount>,
+                <X as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of f64")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] SignedAmount);
+
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(X::try_from(wrapped.0).map_err(de::Error::custom)?);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }
@@ -262,6 +405,7 @@ pub mod as_str {
     use super::DisplayFullError;
     use crate::amount::{Denomination, SignedAmount};
 
+    #[inline]
     pub fn serialize<A, S: Serializer>(a: &A, s: S) -> Result<S::Ok, S::Error>
     where
         A: Into<SignedAmount> + Copy,
@@ -270,6 +414,7 @@ pub mod as_str {
         str::serialize(&amount.to_string_in(Denomination::Bitcoin), s)
     }
 
+    #[inline]
     pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<A, D::Error>
     where
         A: TryFrom<SignedAmount>,
@@ -296,6 +441,7 @@ pub mod as_str {
 
         use crate::amount::{Denomination, SignedAmount};
 
+        #[inline]
         #[allow(clippy::ref_option)] // API forced by serde.
         pub fn serialize<A, S: Serializer>(a: &Option<A>, s: S) -> Result<S::Ok, S::Error>
         where
@@ -328,6 +474,7 @@ pub mod as_str {
                     write!(formatter, "an Option<String>")
                 }
 
+                #[inline]
                 fn visit_none<E>(self) -> Result<Self::Value, E>
                 where
                     E: de::Error,
@@ -335,6 +482,7 @@ pub mod as_str {
                     Ok(None)
                 }
 
+                #[inline]
                 fn visit_some<D>(self, d: D) -> Result<Self::Value, D::Error>
                 where
                     D: Deserializer<'de>,
@@ -343,6 +491,72 @@ pub mod as_str {
                 }
             }
             d.deserialize_option(VisitOptAmt::<A>(PhantomData))
+        }
+    }
+
+    pub mod vec {
+        //! Serialize and deserialize `Vec<Amount>` and `Vec<SignedAmount>` as JSON strings
+        //! denominated in BTC.
+        //!
+        //! Use with `#[serde(with = "amount::serde::as_str::vec")]`.
+
+        use alloc::vec::Vec;
+        use core::fmt;
+        use core::marker::PhantomData;
+
+        use serde::de::{self, SeqAccess};
+        use serde::ser::SerializeSeq;
+        use serde::{Deserialize, Deserializer, Serializer};
+
+        use crate::amount::{Denomination, SignedAmount};
+
+        pub fn serialize<A, S: Serializer>(a: &[A], s: S) -> Result<S::Ok, S::Error>
+        where
+            A: Into<SignedAmount> + Copy,
+        {
+            let mut seq = s.serialize_seq(Some(a.len()))?;
+            for amount in a {
+                let signed_amount: SignedAmount = (*amount).into();
+                seq.serialize_element(&signed_amount.to_string_in(Denomination::Bitcoin))?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'d, A, D: Deserializer<'d>>(d: D) -> Result<Vec<A>, D::Error>
+        where
+            A: TryFrom<SignedAmount>,
+            <A as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+        {
+            struct VisitVec<X>(PhantomData<X>);
+
+            impl<'de, X> de::Visitor<'de> for VisitVec<X>
+            where
+                X: TryFrom<SignedAmount>,
+                <X as TryFrom<SignedAmount>>::Error: core::fmt::Display,
+            {
+                type Value = Vec<X>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a sequence of String")
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    #[derive(Deserialize)]
+                    #[serde(transparent)]
+                    struct Wrapper(#[serde(with = "super")] SignedAmount);
+
+                    let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                    while let Some(wrapped) = seq.next_element::<Wrapper>()? {
+                        out.push(X::try_from(wrapped.0).map_err(de::Error::custom)?);
+                    }
+                    Ok(out)
+                }
+            }
+
+            d.deserialize_seq(VisitVec::<A>(PhantomData))
         }
     }
 }

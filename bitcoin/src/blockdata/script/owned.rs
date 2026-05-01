@@ -3,15 +3,16 @@
 #[cfg(doc)]
 use core::ops::Deref;
 
-use hex::FromHex as _;
 use internals::ToU64 as _;
 
 use super::{
     opcode_to_verify, write_scriptint, Builder, Error, Instruction, PushBytes, ScriptBuf,
-    ScriptExtPriv as _, ScriptPubKeyBuf,
+    ScriptExtPriv as _, ScriptPubKeyBuf, ScriptSigBuf, WitnessScript,
 };
+use crate::internal_macros;
 use crate::key::{
-    PubkeyHash, PublicKey, TapTweak, TweakedPublicKey, UntweakedPublicKey, WPubkeyHash,
+    FullPublicKey, LegacyPublicKey, PubkeyHash, TapTweak, TweakedPublicKey, UntweakedPublicKey,
+    WPubkeyHash,
 };
 use crate::opcodes::all::*;
 use crate::opcodes::{self, Opcode};
@@ -20,7 +21,6 @@ use crate::script::witness_program::{WitnessProgram, P2A_PROGRAM};
 use crate::script::witness_version::WitnessVersion;
 use crate::script::{self, ScriptHash, WScriptHash};
 use crate::taproot::TapNodeHash;
-use crate::{consensus, internal_macros};
 
 internal_macros::define_extension_trait! {
     /// Extension functionality for the [`ScriptBuf`] type.
@@ -146,31 +146,11 @@ internal_macros::define_extension_trait! {
         fn scan_and_push_verify(&mut self) { self.push_verify(self.last_opcode()); }
 
         /// Constructs a new [`ScriptBuf`] from a hex string.
-        ///
-        /// The input string is expected to be consensus encoded i.e., includes the length prefix.
-        fn from_hex_prefixed(s: &str) -> Result<Self, consensus::FromHexError>
-            where Self: Sized
-        {
-            consensus::encode::deserialize_hex(s)
-        }
-
-        /// Constructs a new [`ScriptBuf`] from a hex string.
         #[deprecated(since = "TBD", note = "use `from_hex_no_length_prefix()` instead")]
-        fn from_hex(s: &str) -> Result<Self, hex::HexToBytesError>
+        fn from_hex(s: &str) -> Result<Self, hex::DecodeVariableLengthBytesError>
             where Self: Sized
         {
             Self::from_hex_no_length_prefix(s)
-        }
-
-        /// Constructs a new [`ScriptBuf`] from a hex string.
-        ///
-        /// This is **not** consensus encoding. If your hex string is a consensus encoded script
-        /// then use `ScriptBuf::from_hex_prefixed`.
-        fn from_hex_no_length_prefix(s: &str) -> Result<Self, hex::HexToBytesError>
-            where Self: Sized
-        {
-            let v = Vec::from_hex(s)?;
-            Ok(Self::from_bytes(v))
         }
 
         // This belongs only on RedeemScript and ScriptPubKey
@@ -192,7 +172,7 @@ crate::internal_macros::define_extension_trait! {
         }
 
         /// Generates P2PK-type of scriptPubkey.
-        fn new_p2pk(pubkey: PublicKey) -> Self {
+        fn new_p2pk(pubkey: LegacyPublicKey) -> Self {
             Builder::new().push_key(pubkey).push_opcode(OP_CHECKSIG).into_script()
         }
 
@@ -229,7 +209,7 @@ crate::internal_macros::define_extension_trait! {
             merkle_root: Option<TapNodeHash>,
         ) -> Self {
             let internal_key = internal_key.into();
-            let (output_key, _) = internal_key.tap_tweak(merkle_root);
+            let output_key = internal_key.tap_tweak(merkle_root);
             // output key is 32 bytes long, so it's safe to use `new_witness_program_unchecked` (Segwitv1)
             script::new_witness_program_unchecked(WitnessVersion::V1, output_key.serialize())
         }
@@ -251,6 +231,38 @@ crate::internal_macros::define_extension_trait! {
                 .push_opcode(witness_program.version().into())
                 .push_slice(witness_program.program())
                 .into_script()
+        }
+    }
+}
+
+crate::internal_macros::define_extension_trait! {
+    /// Extension functionality for the [`ScriptSigBuf`] type.
+    pub trait ScriptSigBufExt impl for ScriptSigBuf {
+        /// Constructs a scriptSig required to spend a P2SH-P2WPKH output.
+        ///
+        /// The scriptSig pushes the P2WPKH redeem script (`0 <20-byte-pubkey-hash>`) which
+        /// is required when spending a P2SH-wrapped Segwit output. The witness data should
+        /// be provided separately using [`WitnessExt::p2wpkh`].
+        ///
+        /// [`WitnessExt::p2wpkh`]: crate::blockdata::witness::WitnessExt::p2wpkh
+        fn p2sh_p2wpkh(pubkey: FullPublicKey) -> Self {
+            let redeem_script: super::ScriptPubKeyBuf = Builder::new().push_int_unchecked(0).push_slice(pubkey.wpubkey_hash()).into_script();
+            Builder::new().push_slice(<&PushBytes>::try_from(redeem_script.as_bytes()).expect("redeem script is 22 bytes")).into_script()
+        }
+
+        /// Constructs a scriptSig required to spend a P2SH-P2WSH output.
+        ///
+        /// The scriptSig pushes the P2WSH redeem script (`0 <32-byte-script-hash>`) which
+        /// is required when spending a P2SH-wrapped Segwit output. The witness data should
+        /// be provided separately using [`WitnessExt::p2wsh`].
+        ///
+        /// [`WitnessExt::p2wsh`]: crate::blockdata::witness::WitnessExt::p2wsh
+        fn p2sh_p2wsh(witness_script: &WitnessScript) -> Result<ScriptSigBuf, super::WitnessScriptSizeError> {
+            use super::WitnessScriptExt as _;
+
+            let hash = witness_script.wscript_hash()?;
+            let redeem_script: super::ScriptPubKeyBuf = Builder::new().push_int_unchecked(0).push_slice(hash).into_script();
+            Ok(Builder::new().push_slice(<&PushBytes>::try_from(redeem_script.as_bytes()).expect("redeem script is 34 bytes")).into_script())
         }
     }
 }

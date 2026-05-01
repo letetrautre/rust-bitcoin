@@ -14,20 +14,21 @@
 //! [BIP-0068]: <https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki>
 //! [BIP-0125]: <https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki>
 
-#[cfg(feature = "encoding")]
-use core::convert::Infallible;
 use core::fmt;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
-#[cfg(feature = "encoding")]
-use internals::write_err;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::locktime::relative::error::TimeOverflowError;
 use crate::locktime::relative::{self, NumberOf512Seconds};
 use crate::parse_int::{self, PrefixedHexError, UnprefixedHexError};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[cfg(feature = "encoding")]
+#[doc(no_inline)]
+pub use self::error::SequenceDecoderError;
 
 /// Bitcoin transaction input sequence number.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -229,6 +230,8 @@ impl Sequence {
     const fn low_u16(self) -> u16 { self.0 as u16 }
 }
 
+crate::internal_macros::impl_fmt_traits_for_u32_wrapper!(Sequence);
+
 impl Default for Sequence {
     /// The default value of sequence is 0xffffffff.
     #[inline]
@@ -245,16 +248,6 @@ impl fmt::Display for Sequence {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(&self.0, f) }
 }
 
-impl fmt::LowerHex for Sequence {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::LowerHex::fmt(&self.0, f) }
-}
-
-impl fmt::UpperHex for Sequence {
-    #[inline]
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::UpperHex::fmt(&self.0, f) }
-}
-
 impl fmt::Debug for Sequence {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -263,18 +256,12 @@ impl fmt::Debug for Sequence {
     }
 }
 
-#[cfg(feature = "alloc")]
 parse_int::impl_parse_str_from_int_infallible!(Sequence, u32, from_consensus);
 
 #[cfg(feature = "encoding")]
-encoding::encoder_newtype_exact! {
-    /// The encoder for the [`Sequence`] type.
-    pub struct SequenceEncoder<'e>(encoding::ArrayEncoder<4>);
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Encodable for Sequence {
+impl encoding::Encode for Sequence {
     type Encoder<'e> = SequenceEncoder<'e>;
+    #[inline]
     fn encoder(&self) -> Self::Encoder<'_> {
         SequenceEncoder::new(encoding::ArrayEncoder::without_length_prefix(
             self.to_consensus_u32().to_le_bytes(),
@@ -282,67 +269,70 @@ impl encoding::Encodable for Sequence {
     }
 }
 
-/// The decoder for the [`Sequence`] type.
 #[cfg(feature = "encoding")]
-pub struct SequenceDecoder(encoding::ArrayDecoder<4>);
-
-#[cfg(feature = "encoding")]
-impl Default for SequenceDecoder {
-    fn default() -> Self { Self::new() }
-}
-
-#[cfg(feature = "encoding")]
-impl SequenceDecoder {
-    /// Constructs a new [`Sequence`] decoder.
-    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Decoder for SequenceDecoder {
-    type Output = Sequence;
-    type Error = SequenceDecoderError;
-
-    #[inline]
-    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        self.0.push_bytes(bytes).map_err(SequenceDecoderError)
-    }
-
-    #[inline]
-    fn end(self) -> Result<Self::Output, Self::Error> {
-        let n = u32::from_le_bytes(self.0.end().map_err(SequenceDecoderError)?);
-        Ok(Sequence::from_consensus(n))
-    }
-
-    #[inline]
-    fn read_limit(&self) -> usize { self.0.read_limit() }
-}
-
-#[cfg(feature = "encoding")]
-impl encoding::Decodable for Sequence {
+impl encoding::Decode for Sequence {
     type Decoder = SequenceDecoder;
+
+    #[inline]
     fn decoder() -> Self::Decoder { SequenceDecoder(encoding::ArrayDecoder::<4>::new()) }
 }
 
-/// An error consensus decoding an `Sequence`.
 #[cfg(feature = "encoding")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SequenceDecoderError(encoding::UnexpectedEofError);
-
-#[cfg(feature = "encoding")]
-impl From<Infallible> for SequenceDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Sequence`] type.
+    #[derive(Debug, Clone)]
+    pub struct SequenceEncoder<'e>(encoding::ArrayEncoder<4>);
 }
 
 #[cfg(feature = "encoding")]
-impl fmt::Display for SequenceDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "sequence decoder error"; self.0)
+crate::decoder_newtype! {
+    /// The decoder for the [`Sequence`] type.
+    #[derive(Debug, Clone)]
+    pub struct SequenceDecoder(encoding::ArrayDecoder<4>);
+
+    /// Constructs a new [`Sequence`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 4], encoding::UnexpectedEofError>) -> Result<Sequence, SequenceDecoderError> {
+        let value = result.map_err(SequenceDecoderError)?;
+        let n = u32::from_le_bytes(value);
+        Ok(Sequence::from_consensus(n))
     }
 }
 
-#[cfg(all(feature = "std", feature = "encoding"))]
-impl std::error::Error for SequenceDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+/// Error types for input sequence numbers.
+pub mod error {
+    #[cfg(feature = "encoding")]
+    use core::convert::Infallible;
+    #[cfg(feature = "encoding")]
+    use core::fmt;
+
+    #[cfg(feature = "encoding")]
+    use internals::write_err;
+
+    /// An error consensus decoding an `Sequence`.
+    #[cfg(feature = "encoding")]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SequenceDecoderError(pub(super) encoding::UnexpectedEofError);
+
+    #[cfg(feature = "encoding")]
+    impl From<Infallible> for SequenceDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    #[cfg(feature = "encoding")]
+    impl fmt::Display for SequenceDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "sequence decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "encoding")]
+    #[cfg(feature = "std")]
+    impl std::error::Error for SequenceDecoderError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
 }
 
 #[cfg(feature = "arbitrary")]
@@ -391,11 +381,18 @@ impl<'a> Arbitrary<'a> for Sequence {
 mod tests {
     #[cfg(feature = "alloc")]
     use alloc::format;
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
+    use alloc::string::ToString;
+    #[cfg(feature = "encoding")]
+    #[cfg(feature = "std")]
+    use std::error::Error;
 
-    #[cfg(all(feature = "encoding", feature = "alloc"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
     use encoding::UnexpectedEofError;
     #[cfg(feature = "encoding")]
-    use encoding::Decoder as _;
+    use encoding::{Decode as _, Decoder as _};
 
     use super::*;
 
@@ -502,7 +499,8 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "encoding", feature = "alloc"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "encoding")]
     fn sequence_decoding_error() {
         let bytes = [0xff, 0xff, 0xff]; // 3 bytes is an EOF error
 
@@ -511,5 +509,20 @@ mod tests {
 
         let error = decoder.end().unwrap_err();
         assert!(matches!(error, SequenceDecoderError(UnexpectedEofError { .. })));
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn decoder_error_display_is_non_empty() {
+        #[cfg(feature = "encoding")]
+        {
+            // SequenceDecoderError
+            let mut decoder = Sequence::decoder();
+            let _ = decoder.push_bytes(&mut [0u8; 3].as_slice());
+            let e = decoder.end().unwrap_err();
+            assert!(!e.to_string().is_empty());
+            #[cfg(feature = "std")]
+            assert!(e.source().is_some());
+        }
     }
 }

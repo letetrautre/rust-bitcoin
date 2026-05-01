@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Bitcoin network.
+//! # Bitcoin network
 //!
 //! The term "network" is overloaded, here [`Network`] refers to the specific
 //! Bitcoin network we are operating on e.g., signet, regtest. The terms
@@ -16,14 +16,20 @@
 extern crate std;
 
 #[cfg(feature = "serde")]
-extern crate serde;
+pub extern crate serde;
 
 use core::fmt;
 use core::str::FromStr;
 
+#[cfg(feature = "arbitrary")]
+use arbitrary::{Arbitrary, Unstructured};
 use internals::error::InputString;
 #[cfg(feature = "serde")]
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::ParseNetworkError;
 
 /// What kind of network we are on.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -236,23 +242,6 @@ pub mod as_core_arg {
     }
 }
 
-/// An error in parsing network string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct ParseNetworkError(InputString);
-
-impl fmt::Display for ParseNetworkError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        // Outputs 'failed to parse <input string> as network'.
-        write!(f, "{}", self.0.display_cannot_parse("network"))
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for ParseNetworkError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
-}
-
 impl FromStr for Network {
     type Err = ParseNetworkError;
 
@@ -272,6 +261,40 @@ impl FromStr for Network {
 
 impl AsRef<Self> for Network {
     fn as_ref(&self) -> &Self { self }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for NetworkKind {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        match bool::arbitrary(u)? {
+            true => Ok(Self::Main),
+            false => Ok(Self::Test),
+        }
+    }
+}
+
+/// Error types for the network.
+pub mod error {
+    use core::fmt;
+
+    use internals::error::InputString;
+
+    /// An error in parsing network string.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct ParseNetworkError(pub(super) InputString);
+
+    impl fmt::Display for ParseNetworkError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            // Outputs 'failed to parse <input string> as network'.
+            write!(f, "{}", self.0.display_cannot_parse("network"))
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for ParseNetworkError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
 }
 
 #[cfg(test)]

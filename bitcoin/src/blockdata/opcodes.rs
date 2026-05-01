@@ -509,7 +509,7 @@ impl From<u8> for Opcode {
 }
 
 impl fmt::Debug for Opcode {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> { fmt::Display::fmt(self, f) }
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result { fmt::Display::fmt(self, f) }
 }
 
 #[cfg(feature = "serde")]
@@ -611,10 +611,12 @@ impl Ordinary {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "std")]
     use std::collections::HashSet;
 
     use super::*;
 
+    #[cfg(feature = "std")]
     macro_rules! roundtrip {
         ($unique:expr, $op:ident) => {
             assert_eq!($op, Opcode::from($op.to_u8()));
@@ -707,6 +709,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn str_roundtrip() {
         let mut unique = HashSet::new();
         roundtrip!(unique, OP_PUSHBYTES_0);

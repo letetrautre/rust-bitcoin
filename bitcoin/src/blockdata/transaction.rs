@@ -10,12 +10,10 @@
 //!
 //! This module provides the structures and functions needed to support transactions.
 
-use core::fmt;
-
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 use encoding::CompactSizeEncoder;
-use internals::{const_casts, write_err, ToU64};
+use internals::{const_casts, ToU64};
 use io::{BufRead, Write};
 
 use super::Weight;
@@ -33,10 +31,19 @@ use crate::{internal_macros, Amount, FeeRate, Sequence, SignedAmount};
 
 #[rustfmt::skip]            // Keep public re-exports separate.
 #[doc(no_inline)]
-pub use primitives::transaction::{ParseTransactionError, ParseOutPointError};
+pub use primitives::transaction::BlockHashDecoderError;
 #[doc(inline)]
 pub use primitives::transaction::{
-    Ntxid, OutPoint, Transaction, TxIn, TxOut, Txid, Version, Wtxid,
+    BlockHashDecoder, Ntxid, OutPoint, OutPointDecoder, OutPointEncoder, Transaction,
+    TransactionDecoder, TransactionEncoder, TxIn, TxInDecoder, TxInEncoder, TxOut, TxOutDecoder,
+    TxOutEncoder, Txid, Version, VersionDecoder, VersionEncoder, WitnessesEncoder, Wtxid,
+};
+
+#[doc(no_inline)]
+pub use self::error::{
+    IndexOutOfBoundsError, InputsIndexError, OutPointDecoderError, OutputsIndexError,
+    ParseOutPointError, ParseTransactionError, TransactionDecoderError, TxInDecoderError,
+    TxOutDecoderError, VersionDecoderError,
 };
 
 impl Encodable for Txid {
@@ -604,65 +611,6 @@ impl TransactionExtPriv for Transaction {
     }
 }
 
-/// Error attempting to do an out of bounds access on the transaction inputs vector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InputsIndexError(pub IndexOutOfBoundsError);
-
-impl fmt::Display for InputsIndexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "invalid input index"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for InputsIndexError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
-impl From<IndexOutOfBoundsError> for InputsIndexError {
-    fn from(e: IndexOutOfBoundsError) -> Self { Self(e) }
-}
-
-/// Error attempting to do an out of bounds access on the transaction outputs vector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputsIndexError(pub IndexOutOfBoundsError);
-
-impl fmt::Display for OutputsIndexError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "invalid output index"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for OutputsIndexError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
-impl From<IndexOutOfBoundsError> for OutputsIndexError {
-    fn from(e: IndexOutOfBoundsError) -> Self { Self(e) }
-}
-
-/// Error attempting to do an out of bounds access on a vector.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct IndexOutOfBoundsError {
-    /// Attempted index access.
-    pub index: usize,
-    /// Length of the vector where access was attempted.
-    pub length: usize,
-}
-
-impl fmt::Display for IndexOutOfBoundsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "index {} is out-of-bounds for vector with length {}", self.index, self.length)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for IndexOutOfBoundsError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
-}
-
 impl Encodable for Version {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         self.to_u32().consensus_encode(w)
@@ -1186,7 +1134,8 @@ impl InputWeightPrediction {
     }
 }
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+transparent_newtype! {
     /// A wrapper type for the coinbase transaction of a block.
     ///
     /// This type exists to distinguish coinbase transactions from regular ones at the type level.
@@ -1248,6 +1197,83 @@ mod sealed {
     impl Sealed for super::Version {}
 }
 
+/// Error types for Bitcoin transactions.
+pub mod error {
+    use core::fmt;
+
+    use internals::write_err;
+
+    #[rustfmt::skip]            // Keep public re-exports separate.
+    #[doc(no_inline)]
+    pub use primitives::transaction::error::{
+        ParseTransactionError, TransactionDecoderError, TxInDecoderError,
+        TxOutDecoderError, OutPointDecoderError, ParseOutPointError, VersionDecoderError,
+    };
+
+    /// Error attempting to do an out of bounds access on the transaction inputs vector.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InputsIndexError(pub IndexOutOfBoundsError);
+
+    impl fmt::Display for InputsIndexError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "invalid input index"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InputsIndexError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    impl From<IndexOutOfBoundsError> for InputsIndexError {
+        fn from(e: IndexOutOfBoundsError) -> Self { Self(e) }
+    }
+
+    /// Error attempting to do an out of bounds access on the transaction outputs vector.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OutputsIndexError(pub IndexOutOfBoundsError);
+
+    impl fmt::Display for OutputsIndexError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "invalid output index"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for OutputsIndexError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    impl From<IndexOutOfBoundsError> for OutputsIndexError {
+        fn from(e: IndexOutOfBoundsError) -> Self { Self(e) }
+    }
+
+    /// Error attempting to do an out of bounds access on a vector.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct IndexOutOfBoundsError {
+        /// Attempted index access.
+        pub index: usize,
+        /// Length of the vector where access was attempted.
+        pub length: usize,
+    }
+
+    impl fmt::Display for IndexOutOfBoundsError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "index {} is out-of-bounds for vector with length {}",
+                self.index, self.length
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for IndexOutOfBoundsError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
+}
+
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for InputWeightPrediction {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
@@ -1274,15 +1300,16 @@ impl<'a> Arbitrary<'a> for InputWeightPrediction {
 
 #[cfg(test)]
 mod tests {
-    use hex::FromHex;
-    use hex_lit::hex;
+    use alloc::string::ToString;
+
+    use hex_unstable::hex;
 
     use super::*;
     use crate::consensus::encode::{deserialize, serialize};
     use crate::constants::WITNESS_SCALE_FACTOR;
-    use crate::parse_int;
     use crate::script::ScriptSigBuf;
     use crate::sighash::EcdsaSighashType;
+    use crate::{hex, parse_int};
 
     const SOME_TX: &str = "0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000";
 
@@ -1484,7 +1511,7 @@ mod tests {
         let tx =
             con_serde::With::<con_serde::Hex>::deserialize::<'_, Transaction, _>(&mut deserializer)
                 .unwrap();
-        let tx_bytes = Vec::from_hex(&json[1..(json.len() - 1)]).unwrap();
+        let tx_bytes = hex::decode_to_vec(&json[1..(json.len() - 1)]).unwrap();
         let expected = deserialize::<Transaction>(&tx_bytes).unwrap();
         assert_eq!(tx, expected);
         let mut bytes = Vec::new();
@@ -1637,12 +1664,14 @@ mod tests {
 
     #[test]
     fn huge_witness() {
-        let hex = Vec::from_hex(include_str!("../../tests/data/huge_witness.hex").trim()).unwrap();
+        let hex =
+            hex::decode_to_vec(include_str!("../../tests/data/huge_witness.hex").trim()).unwrap();
         deserialize::<Transaction>(&hex).unwrap();
     }
 
     #[test]
     #[cfg(feature = "bitcoinconsensus")]
+    #[cfg(feature = "std")]
     fn transaction_verify() {
         use std::collections::HashMap;
 
@@ -1810,7 +1839,7 @@ mod tests {
 
         for (is_segwit, tx, expected_weight) in &txs {
             let txin_weight = if *is_segwit { TxIn::segwit_weight } else { TxIn::legacy_weight };
-            let tx: Transaction = deserialize(Vec::from_hex(tx).unwrap().as_slice()).unwrap();
+            let tx: Transaction = deserialize(hex::decode_to_vec(tx).unwrap().as_slice()).unwrap();
             assert_eq!(*is_segwit, tx.uses_segwit_serialization());
 
             let mut calculated_weight = empty_transaction_weight
@@ -1968,7 +1997,7 @@ mod tests {
         fn return_none(_outpoint: &OutPoint) -> Option<TxOut> { None }
 
         for (hx, expected, spent_fn, expected_none) in tx_hexes.iter() {
-            let tx_bytes = Vec::from_hex(hx).unwrap();
+            let tx_bytes = hex::decode_to_vec(hx).unwrap();
             let tx: Transaction = deserialize(&tx_bytes).unwrap();
             assert_eq!(tx.total_sigop_cost(spent_fn), *expected);
             assert_eq!(tx.total_sigop_cost(return_none), *expected_none);
@@ -2105,16 +2134,23 @@ mod tests {
     fn outpoint_format() {
         let outpoint = OutPoint::COINBASE_PREVOUT;
 
-        let debug = "OutPoint { txid: 0000000000000000000000000000000000000000000000000000000000000000, vout: 4294967295 }";
+        let debug = "OutPoint { txid: Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000)), vout: 4294967295 }";
         assert_eq!(debug, format!("{:?}", &outpoint));
 
         let display = "0000000000000000000000000000000000000000000000000000000000000000:4294967295";
         assert_eq!(display, format!("{}", &outpoint));
 
-        let pretty_debug = "OutPoint {\n    txid: 0x0000000000000000000000000000000000000000000000000000000000000000,\n    vout: 4294967295,\n}";
+        let pretty_debug = "OutPoint {
+    txid: Txid(
+        bitcoin_hashes::sha256d::Hash(
+            0x0000000000000000000000000000000000000000000000000000000000000000,
+        ),
+    ),
+    vout: 4294967295,
+}";
         assert_eq!(pretty_debug, format!("{:#?}", &outpoint));
 
-        let debug_txid = "0000000000000000000000000000000000000000000000000000000000000000";
+        let debug_txid = "Txid(bitcoin_hashes::sha256d::Hash(0000000000000000000000000000000000000000000000000000000000000000))";
         assert_eq!(debug_txid, format!("{:?}", &outpoint.txid));
 
         let display_txid = "0000000000000000000000000000000000000000000000000000000000000000";

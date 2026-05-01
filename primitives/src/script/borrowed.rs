@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
+#[cfg(feature = "alloc")]
+#[cfg(feature = "hex")]
+use alloc::string::String;
 use core::marker::PhantomData;
 use core::ops::{
     Bound, Index, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
@@ -7,12 +10,13 @@ use core::ops::{
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
-use encoding::{BytesEncoder, CompactSizeEncoder, Encodable, Encoder2};
+use encoding::{BytesEncoder, CompactSizeEncoder, Encode, Encoder2};
 
 use super::ScriptBuf;
 use crate::prelude::{Box, ToOwned, Vec};
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+crate::transparent_newtype! {
     /// Bitcoin script slice.
     ///
     /// *[See also the `bitcoin::script` module](super).*
@@ -58,6 +62,8 @@ internals::transparent_newtype! {
     /// the prefix is excluded. To support parsing and formatting scripts as hex we provide a bunch
     /// of different APIs and trait implementations. Please see [`examples/script.rs`] for a
     /// thorough example of all the APIs.
+    ///
+    /// [`examples/script.rs`]: <https://github.com/rust-bitcoin/rust-bitcoin/blob/master/bitcoin/examples/script.rs>
     ///
     /// # Bitcoin Core References
     ///
@@ -119,6 +125,31 @@ impl<T> Script<T> {
     #[deprecated(since = "0.101.0", note = "use to_vec instead")]
     pub fn to_bytes(&self) -> Vec<u8> { self.to_vec() }
 
+    /// Consensus encodes the script as lower-case hex.
+    ///
+    /// Consensus encoding includes a length prefix. To hex encode without the length prefix use
+    /// `to_hex_string_no_length_prefix`.
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    pub fn to_hex_string_prefixed(&self) -> String {
+        use hex_unstable::{BytesToHexIter, Case};
+
+        let iter = encoding::EncoderByteIter::new(self.encoder());
+        BytesToHexIter::new(iter, Case::Lower).collect()
+    }
+
+    /// Encodes the script as lower-case hex.
+    ///
+    /// This is **not** consensus encoding. The returned hex string will not include the length
+    /// prefix. See `to_hex_string_prefixed`.
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    pub fn to_hex_string_no_length_prefix(&self) -> String {
+        use hex_unstable::DisplayHex as _;
+
+        self.as_bytes().to_lower_hex_string()
+    }
+
     /// Returns the length in bytes of the script.
     #[inline]
     pub const fn len(&self) -> usize { self.as_bytes().len() }
@@ -146,7 +177,6 @@ impl<T> Script<T> {
     ///
     /// Just the script bytes in hexadecimal **not** consensus encoding of the script i.e., the
     /// string will not include a length prefix.
-    #[cfg(feature = "alloc")]
     #[cfg(feature = "hex")]
     #[inline]
     #[deprecated(since = "1.0.0-rc.0", note = "use `format!(\"{var:x}\")` instead")]
@@ -155,10 +185,11 @@ impl<T> Script<T> {
 
 encoding::encoder_newtype_exact! {
     /// The encoder for the [`Script<T>`] type.
+    #[derive(Debug, Clone)]
     pub struct ScriptEncoder<'e>(Encoder2<CompactSizeEncoder, BytesEncoder<'e>>);
 }
 
-impl<T> Encodable for Script<T> {
+impl<T> Encode for Script<T> {
     type Encoder<'e>
         = ScriptEncoder<'e>
     where
@@ -206,80 +237,3 @@ delegate_index!(
     RangeToInclusive<usize>,
     (Bound<usize>, Bound<usize>)
 );
-
-#[cfg(test)]
-mod tests {
-    // All tests should compile and pass no matter which script type you put here.
-    type Script = super::super::ScriptSig;
-
-    #[cfg(feature = "alloc")]
-    use alloc::{borrow::ToOwned, vec};
-
-    #[test]
-    fn script_from_bytes() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.as_bytes(), [1, 2, 3]);
-    }
-
-    #[test]
-    fn script_from_bytes_mut() {
-        let bytes = &mut [1, 2, 3];
-        let script = Script::from_bytes_mut(bytes);
-        script.as_mut_bytes()[0] = 4;
-        assert_eq!(script.as_mut_bytes(), [4, 2, 3]);
-    }
-
-    #[test]
-    fn script_to_vec() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.to_vec(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn script_len() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert_eq!(script.len(), 3);
-    }
-
-    #[test]
-    fn script_is_empty() {
-        let script: &Script = Default::default();
-        assert!(script.is_empty());
-
-        let script = Script::from_bytes(&[1, 2, 3]);
-        assert!(!script.is_empty());
-    }
-
-    #[test]
-    fn script_to_owned() {
-        let script = Script::from_bytes(&[1, 2, 3]);
-        let script_buf = script.to_owned();
-        assert_eq!(script_buf.as_bytes(), [1, 2, 3]);
-    }
-
-    #[test]
-    fn test_index() {
-        let script = Script::from_bytes(&[1, 2, 3, 4, 5]);
-
-        assert_eq!(script[1..3].as_bytes(), &[2, 3]);
-        assert_eq!(script[2..].as_bytes(), &[3, 4, 5]);
-        assert_eq!(script[..3].as_bytes(), &[1, 2, 3]);
-        assert_eq!(script[..].as_bytes(), &[1, 2, 3, 4, 5]);
-        assert_eq!(script[1..=3].as_bytes(), &[2, 3, 4]);
-        assert_eq!(script[..=2].as_bytes(), &[1, 2, 3]);
-    }
-
-    #[test]
-    #[cfg(feature = "alloc")]
-    fn encode() {
-        // Consensus encoding includes the length of the encoded data
-        // (compact size encoded length prefix).
-        let consensus_encoded: [u8; 6] = [0x05, 1, 2, 3, 4, 5];
-
-        // `from_bytes` does not expect the prefix.
-        let script = Script::from_bytes(&consensus_encoded[1..]);
-
-        let got = encoding::encode_to_vec(script);
-        assert_eq!(got, consensus_encoded);
-    }
-}

@@ -21,14 +21,6 @@ pub(super) enum ErrorInner {
     TooShort(TooShortError),
 }
 
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl From<Infallible> for ErrorInner {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
 impl Error {
     /// Returns the invalid base58 character, if encountered.
     pub fn invalid_character(&self) -> Option<u8> {
@@ -55,9 +47,17 @@ impl Error {
     }
 }
 
+impl From<Infallible> for Error {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
+impl From<Infallible> for ErrorInner {
+    fn from(never: Infallible) -> Self { match never {} }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use ErrorInner::*;
+        use ErrorInner::{Decode, IncorrectChecksum, TooShort};
 
         match self.0 {
             Decode(ref e) => write_err!(f, "decode"; e),
@@ -70,7 +70,7 @@ impl fmt::Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        use ErrorInner::*;
+        use ErrorInner::{Decode, IncorrectChecksum, TooShort};
 
         match self.0 {
             Decode(ref e) => Some(e),
@@ -116,7 +116,9 @@ impl fmt::Display for IncorrectChecksumError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for IncorrectChecksumError {}
+impl std::error::Error for IncorrectChecksumError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 /// The decoded base58 data was too short (require at least 4 bytes for checksum).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +126,7 @@ pub(super) struct TooShortError {
     /// The length of the decoded data.
     pub(super) length: usize,
 }
+
 impl From<Infallible> for TooShortError {
     fn from(never: Infallible) -> Self { match never {} }
 }
@@ -139,7 +142,9 @@ impl fmt::Display for TooShortError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for TooShortError {}
+impl std::error::Error for TooShortError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 /// Found an invalid ASCII byte while decoding base58 string.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,19 +155,19 @@ pub(super) struct InvalidCharacterErrorInner {
     pub(super) invalid: u8,
 }
 
+impl InvalidCharacterError {
+    pub(super) fn new(invalid: u8) -> Self { Self(InvalidCharacterErrorInner { invalid }) }
+
+    /// Returns the invalid base58 character.
+    pub fn invalid_character(&self) -> u8 { self.0.invalid }
+}
+
 impl From<Infallible> for InvalidCharacterError {
     fn from(never: Infallible) -> Self { match never {} }
 }
 
 impl From<Infallible> for InvalidCharacterErrorInner {
     fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl InvalidCharacterError {
-    pub(super) fn new(invalid: u8) -> Self { Self(InvalidCharacterErrorInner { invalid }) }
-
-    /// Returns the invalid base58 character.
-    pub fn invalid_character(&self) -> u8 { self.0.invalid }
 }
 
 impl fmt::Display for InvalidCharacterError {
@@ -172,4 +177,6 @@ impl fmt::Display for InvalidCharacterError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for InvalidCharacterError {}
+impl std::error::Error for InvalidCharacterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}

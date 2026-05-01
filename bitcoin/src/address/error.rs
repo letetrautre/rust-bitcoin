@@ -156,7 +156,9 @@ impl fmt::Display for NetworkValidationError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for NetworkValidationError {}
+impl std::error::Error for NetworkValidationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 /// Bech32 related error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,7 +311,9 @@ impl fmt::Display for InvalidBase58PayloadLengthError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for InvalidBase58PayloadLengthError {}
+impl std::error::Error for InvalidBase58PayloadLengthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 /// Legacy base58 address was too long, max 50 characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,7 +338,9 @@ impl fmt::Display for LegacyAddressTooLongError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for LegacyAddressTooLongError {}
+impl std::error::Error for LegacyAddressTooLongError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 /// Invalid legacy address prefix in decoded base58 data.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,4 +361,6 @@ impl fmt::Display for InvalidLegacyPrefixError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for InvalidLegacyPrefixError {}
+impl std::error::Error for InvalidLegacyPrefixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}

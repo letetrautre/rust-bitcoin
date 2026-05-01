@@ -5,8 +5,6 @@
 //! This module describes BIP-0157 Client Side Block Filtering network messages.
 
 use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::fmt;
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
@@ -15,13 +13,20 @@ use encoding::{
     Decoder3, Decoder4, Encoder2, Encoder3, Encoder4, SliceEncoder, VecDecoder,
 };
 use hashes::{sha256d, HashEngine};
-use internals::write_err;
 use primitives::block::{BlockHashDecoder, BlockHashEncoder};
 use primitives::BlockHash;
 use units::block::{BlockHeightDecoder, BlockHeightEncoder};
 use units::BlockHeight;
 
 use crate::consensus::impl_consensus_encoding;
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{
+    CFCheckptDecoderError, CFHeadersDecoderError, CFilterDecoderError, FilterHashDecoderError,
+    FilterHeaderDecoderError, GetCFCheckptDecoderError, GetCFHeadersDecoderError,
+    GetCFiltersDecoderError,
+};
 
 hashes::hash_newtype! {
     /// Filter hash, as defined in BIP-0157.
@@ -31,6 +36,8 @@ hashes::hash_newtype! {
 }
 
 hashes::impl_hex_for_newtype!(FilterHash, FilterHeader);
+#[cfg(feature = "serde")]
+hashes::impl_serde_for_newtype!(FilterHash, FilterHeader);
 
 impl FilterHash {
     /// Computes the filter header from a filter hash and previous filter header.
@@ -62,12 +69,13 @@ macro_rules! impl_hashencode {
 impl_hashencode!(FilterHash);
 impl_hashencode!(FilterHeader);
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for [`FilterHash`].
+    #[derive(Debug, Clone)]
     pub struct FilterHashEncoder<'e>(ArrayEncoder<32>);
 }
 
-impl encoding::Encodable for FilterHash {
+impl encoding::Encode for FilterHash {
     type Encoder<'e> = FilterHashEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -75,12 +83,13 @@ impl encoding::Encodable for FilterHash {
     }
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for [`FilterHeader`].
+    #[derive(Debug, Clone)]
     pub struct FilterHeaderEncoder<'e>(ArrayEncoder<32>);
 }
 
-impl encoding::Encodable for FilterHeader {
+impl encoding::Encode for FilterHeader {
     type Encoder<'e> = FilterHeaderEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -91,6 +100,7 @@ impl encoding::Encodable for FilterHeader {
 type HashInnerDecoder = ArrayDecoder<32>;
 
 /// Decoder for the [`FilterHash`] type.
+#[derive(Debug, Clone)]
 pub struct FilterHashDecoder(HashInnerDecoder);
 
 impl encoding::Decoder for FilterHashDecoder {
@@ -112,32 +122,14 @@ impl encoding::Decoder for FilterHashDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for FilterHash {
+impl encoding::Decode for FilterHash {
     type Decoder = FilterHashDecoder;
 
     fn decoder() -> Self::Decoder { FilterHashDecoder(ArrayDecoder::new()) }
 }
 
-/// Errors occuring when decoding a [`FilterHash`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterHashDecoderError(<HashInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for FilterHashDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for FilterHashDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "filterhash error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for FilterHashDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
 /// Decoder for the [`FilterHeader`] type.
+#[derive(Debug, Clone)]
 pub struct FilterHeaderDecoder(HashInnerDecoder);
 
 impl encoding::Decoder for FilterHeaderDecoder {
@@ -159,29 +151,10 @@ impl encoding::Decoder for FilterHeaderDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for FilterHeader {
+impl encoding::Decode for FilterHeader {
     type Decoder = FilterHeaderDecoder;
 
     fn decoder() -> Self::Decoder { FilterHeaderDecoder(ArrayDecoder::new()) }
-}
-
-/// Errors occuring when decoding a [`FilterHash`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FilterHeaderDecoderError(<HashInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for FilterHeaderDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for FilterHeaderDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "filterheader error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for FilterHeaderDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 #[cfg(feature = "arbitrary")]
@@ -209,12 +182,13 @@ pub struct GetCFilters {
     pub stop_hash: BlockHash,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for the [`GetCFilters`] message.
+    #[derive(Debug, Clone)]
     pub struct GetCFiltersEncoder<'e>(Encoder3<ArrayEncoder<1>, BlockHeightEncoder<'e>, BlockHashEncoder<'e>>);
 }
 
-impl encoding::Encodable for GetCFilters {
+impl encoding::Encode for GetCFilters {
     type Encoder<'e> = GetCFiltersEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -229,6 +203,7 @@ impl encoding::Encodable for GetCFilters {
 type GetCFiltersInnerDecoder = Decoder3<ArrayDecoder<1>, BlockHeightDecoder, BlockHashDecoder>;
 
 /// Decoder type for the [`GetCFilters`] message.
+#[derive(Debug, Clone)]
 pub struct GetCFiltersDecoder(GetCFiltersInnerDecoder);
 
 impl encoding::Decoder for GetCFiltersDecoder {
@@ -250,7 +225,7 @@ impl encoding::Decoder for GetCFiltersDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for GetCFilters {
+impl encoding::Decode for GetCFilters {
     type Decoder = GetCFiltersDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -260,25 +235,6 @@ impl encoding::Decodable for GetCFilters {
             BlockHashDecoder::new(),
         ))
     }
-}
-
-/// Errors occuring when decoding a [`GetCFilters`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetCFiltersDecoderError(<GetCFiltersInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for GetCFiltersDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for GetCFiltersDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "getcfilters error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for GetCFiltersDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(GetCFilters, filter_type, start_height, stop_hash);
@@ -294,8 +250,9 @@ pub struct CFilter {
     pub filter: Vec<u8>,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for a [`CFilter`] message.
+    #[derive(Debug, Clone)]
     pub struct CFilterEncoder<'e>(
         Encoder3<
             ArrayEncoder<1>,
@@ -305,7 +262,7 @@ encoding::encoder_newtype! {
     );
 }
 
-impl encoding::Encodable for CFilter {
+impl encoding::Encode for CFilter {
     type Encoder<'e>
         = CFilterEncoder<'e>
     where
@@ -326,6 +283,7 @@ impl encoding::Encodable for CFilter {
 type CFilterInnerDecoder = Decoder3<ArrayDecoder<1>, BlockHashDecoder, ByteVecDecoder>;
 
 /// Decoder type for a [`CFilter`] message.
+#[derive(Debug, Clone)]
 pub struct CFilterDecoder(CFilterInnerDecoder);
 
 impl encoding::Decoder for CFilterDecoder {
@@ -347,7 +305,7 @@ impl encoding::Decoder for CFilterDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for CFilter {
+impl encoding::Decode for CFilter {
     type Decoder = CFilterDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -357,25 +315,6 @@ impl encoding::Decodable for CFilter {
             ByteVecDecoder::new(),
         ))
     }
-}
-
-/// Errors occuring when decoding a [`CFilter`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CFilterDecoderError(<CFilterInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for CFilterDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for CFilterDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "cfilter error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CFilterDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(CFilter, filter_type, block_hash, filter);
@@ -391,12 +330,13 @@ pub struct GetCFHeaders {
     pub stop_hash: BlockHash,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for the [`GetCFHeaders`] message.
+    #[derive(Debug, Clone)]
     pub struct GetCFHeadersEncoder<'e>(Encoder3<ArrayEncoder<1>, BlockHeightEncoder<'e>, BlockHashEncoder<'e>>);
 }
 
-impl encoding::Encodable for GetCFHeaders {
+impl encoding::Encode for GetCFHeaders {
     type Encoder<'e> = GetCFHeadersEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -411,6 +351,7 @@ impl encoding::Encodable for GetCFHeaders {
 type GetCFHeadersInnerDecoder = Decoder3<ArrayDecoder<1>, BlockHeightDecoder, BlockHashDecoder>;
 
 /// Decoder type for the [`GetCFHeaders`] message.
+#[derive(Debug, Clone)]
 pub struct GetCFHeadersDecoder(GetCFHeadersInnerDecoder);
 
 impl encoding::Decoder for GetCFHeadersDecoder {
@@ -432,7 +373,7 @@ impl encoding::Decoder for GetCFHeadersDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for GetCFHeaders {
+impl encoding::Decode for GetCFHeaders {
     type Decoder = GetCFHeadersDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -442,25 +383,6 @@ impl encoding::Decodable for GetCFHeaders {
             BlockHashDecoder::new(),
         ))
     }
-}
-
-/// Errors occuring when decoding a [`GetCFHeaders`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetCFHeadersDecoderError(<GetCFHeadersInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for GetCFHeadersDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for GetCFHeadersDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "getcfheaders error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for GetCFHeadersDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(GetCFHeaders, filter_type, start_height, stop_hash);
@@ -480,6 +402,7 @@ pub struct CFHeaders {
 
 encoding::encoder_newtype! {
     /// Encoder type for a [`CFHeaders`] message.
+    #[derive(Debug, Clone)]
     pub struct CFHeadersEncoder<'e>(
         Encoder4<
             ArrayEncoder<1>,
@@ -490,7 +413,7 @@ encoding::encoder_newtype! {
     );
 }
 
-impl encoding::Encodable for CFHeaders {
+impl encoding::Encode for CFHeaders {
     type Encoder<'e> = CFHeadersEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -510,6 +433,7 @@ type CFHeadersInnerDecoder =
     Decoder4<ArrayDecoder<1>, BlockHashDecoder, FilterHeaderDecoder, VecDecoder<FilterHash>>;
 
 /// Decoder type for a [`CFHeaders`] message.
+#[derive(Debug, Clone)]
 pub struct CFHeadersDecoder(CFHeadersInnerDecoder);
 
 impl encoding::Decoder for CFHeadersDecoder {
@@ -537,7 +461,7 @@ impl encoding::Decoder for CFHeadersDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for CFHeaders {
+impl encoding::Decode for CFHeaders {
     type Decoder = CFHeadersDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -550,24 +474,6 @@ impl encoding::Decodable for CFHeaders {
     }
 }
 
-/// Errors occuring when decoding a [`GetCFCheckpt`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CFHeadersDecoderError(<CFHeadersInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for CFHeadersDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for CFHeadersDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "cfheaders error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CFHeadersDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
 impl_consensus_encoding!(CFHeaders, filter_type, stop_hash, previous_filter_header, filter_hashes);
 
 /// getcfcheckpt message
@@ -579,12 +485,13 @@ pub struct GetCFCheckpt {
     pub stop_hash: BlockHash,
 }
 
-encoding::encoder_newtype! {
+encoding::encoder_newtype_exact! {
     /// Encoder type for the [`GetCFCheckpt`] message.
+    #[derive(Debug, Clone)]
     pub struct GetCFCheckptEncoder<'e>(Encoder2<ArrayEncoder<1>, BlockHashEncoder<'e>>);
 }
 
-impl encoding::Encodable for GetCFCheckpt {
+impl encoding::Encode for GetCFCheckpt {
     type Encoder<'e> = GetCFCheckptEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -598,6 +505,7 @@ impl encoding::Encodable for GetCFCheckpt {
 type GetCFCheckptInnerDecoder = Decoder2<ArrayDecoder<1>, BlockHashDecoder>;
 
 /// Decoder type for a [`GetCFCheckpt`] message.
+#[derive(Debug, Clone)]
 pub struct GetCFCheckptDecoder(GetCFCheckptInnerDecoder);
 
 impl encoding::Decoder for GetCFCheckptDecoder {
@@ -619,31 +527,12 @@ impl encoding::Decoder for GetCFCheckptDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for GetCFCheckpt {
+impl encoding::Decode for GetCFCheckpt {
     type Decoder = GetCFCheckptDecoder;
 
     fn decoder() -> Self::Decoder {
         GetCFCheckptDecoder(Decoder2::new(ArrayDecoder::new(), BlockHashDecoder::new()))
     }
-}
-
-/// Errors occuring when decoding a [`GetCFCheckpt`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GetCFCheckptDecoderError(<GetCFCheckptInnerDecoder as encoding::Decoder>::Error);
-
-impl From<Infallible> for GetCFCheckptDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for GetCFCheckptDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "getcfcheckpt error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for GetCFCheckptDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl_consensus_encoding!(GetCFCheckpt, filter_type, stop_hash);
@@ -661,6 +550,7 @@ pub struct CFCheckpt {
 
 encoding::encoder_newtype! {
     /// Encoder type for a [`CFCheckpt`] message.
+    #[derive(Debug, Clone)]
     pub struct CFCheckptEncoder<'e>(
         Encoder3<
             ArrayEncoder<1>,
@@ -670,7 +560,7 @@ encoding::encoder_newtype! {
     );
 }
 
-impl encoding::Encodable for CFCheckpt {
+impl encoding::Encode for CFCheckpt {
     type Encoder<'e>
         = CFCheckptEncoder<'e>
     where
@@ -691,6 +581,7 @@ impl encoding::Encodable for CFCheckpt {
 type CFCheckptInnerDecoder = Decoder3<ArrayDecoder<1>, BlockHashDecoder, VecDecoder<FilterHeader>>;
 
 /// Decoder type for a [`CFCheckpt`] message.
+#[derive(Debug, Clone)]
 pub struct CFCheckptDecoder(CFCheckptInnerDecoder);
 
 impl encoding::Decoder for CFCheckptDecoder {
@@ -712,7 +603,7 @@ impl encoding::Decoder for CFCheckptDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for CFCheckpt {
+impl encoding::Decode for CFCheckpt {
     type Decoder = CFCheckptDecoder;
 
     fn decoder() -> Self::Decoder {
@@ -724,26 +615,199 @@ impl encoding::Decodable for CFCheckpt {
     }
 }
 
-/// Errors occuring when decoding a [`CFCheckpt`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CFCheckptDecoderError(<CFCheckptInnerDecoder as encoding::Decoder>::Error);
+impl_consensus_encoding!(CFCheckpt, filter_type, stop_hash, filter_headers);
 
-impl From<Infallible> for CFCheckptDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
+/// Error types for client side block filtering messages.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
 
-impl fmt::Display for CFCheckptDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "cfcheckpt error"; self.0)
+    use internals::write_err;
+
+    /// Errors occuring when decoding a [`FilterHash`] message.
+    ///
+    /// [`FilterHash`]: super::FilterHash
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilterHashDecoderError(
+        pub(super) <super::HashInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for FilterHashDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for FilterHashDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "filterhash error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for FilterHashDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`FilterHeader`] message.
+    ///
+    /// [`FilterHeader`]: super::FilterHeader
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct FilterHeaderDecoderError(
+        pub(super) <super::HashInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for FilterHeaderDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for FilterHeaderDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "filterheader error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for FilterHeaderDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`GetCFilters`] message.
+    ///
+    /// [`GetCFilters`]: super::GetCFilters
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetCFiltersDecoderError(
+        pub(super) <super::GetCFiltersInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for GetCFiltersDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for GetCFiltersDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "getcfilters error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for GetCFiltersDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`CFilter`] message.
+    ///
+    /// [`CFilter`]: super::CFilter
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CFilterDecoderError(
+        pub(super) <super::CFilterInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for CFilterDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for CFilterDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "cfilter error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for CFilterDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`GetCFHeaders`] message.
+    ///
+    /// [`GetCFHeaders`]: super::GetCFHeaders
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetCFHeadersDecoderError(
+        pub(super) <super::GetCFHeadersInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for GetCFHeadersDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for GetCFHeadersDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "getcfheaders error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for GetCFHeadersDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`CFHeaders`] message.
+    ///
+    /// [`CFHeaders`]: super::CFHeaders
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CFHeadersDecoderError(
+        pub(super) <super::CFHeadersInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for CFHeadersDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for CFHeadersDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "cfheaders error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for CFHeadersDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`GetCFCheckpt`] message.
+    ///
+    /// [`GetCFCheckpt`]: super::GetCFCheckpt
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetCFCheckptDecoderError(
+        pub(super) <super::GetCFCheckptInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for GetCFCheckptDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for GetCFCheckptDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "getcfcheckpt error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for GetCFCheckptDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`CFCheckpt`] message.
+    ///
+    /// [`CFCheckpt`]: super::CFCheckpt
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CFCheckptDecoderError(
+        pub(super) <super::CFCheckptInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for CFCheckptDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for CFCheckptDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "cfcheckpt error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for CFCheckptDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
     }
 }
-
-#[cfg(feature = "std")]
-impl std::error::Error for CFCheckptDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
-}
-
-impl_consensus_encoding!(CFCheckpt, filter_type, stop_hash, filter_headers);
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for GetCFilters {

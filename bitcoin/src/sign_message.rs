@@ -6,74 +6,32 @@
 //! library is used with the `secp-recovery` feature.
 
 use hashes::{sha256d, HashEngine};
-#[cfg(feature = "secp-recovery")]
-use secp256k1::SecretKey;
 
 use crate::consensus::encode::WriteExt;
+#[cfg(feature = "secp-recovery")]
+use crate::key::PrivateKeyExt as _;
+#[cfg(feature = "secp-recovery")]
+use crate::PrivateKey;
 
 #[rustfmt::skip]
 #[doc(inline)]
 #[cfg(feature = "secp-recovery")]
-pub use self::message_signing::{MessageSignature, MessageSignatureError};
+pub use self::message_signing::MessageSignature;
+#[doc(no_inline)]
+#[cfg(feature = "secp-recovery")]
+pub use self::error::MessageSignatureError;
 
 /// The prefix for signed messages using Bitcoin's message signing protocol.
 pub const BITCOIN_SIGNED_MSG_PREFIX: &[u8] = b"\x18Bitcoin Signed Message:\n";
 
 #[cfg(feature = "secp-recovery")]
 mod message_signing {
-    use core::convert::Infallible;
-    use core::fmt;
-
     use hashes::sha256d;
-    use internals::write_err;
     use secp256k1::ecdsa::{RecoverableSignature, RecoveryId};
 
+    use super::error::MessageSignatureError;
     use crate::address::{Address, AddressType};
-    use crate::crypto::key::PublicKey;
-
-    /// An error used for dealing with Bitcoin Signed Messages.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum MessageSignatureError {
-        /// Signature is expected to be 65 bytes.
-        InvalidLength,
-        /// The signature is invalidly constructed.
-        InvalidEncoding(secp256k1::Error),
-        /// Invalid base64 encoding.
-        InvalidBase64,
-        /// Unsupported Address Type
-        UnsupportedAddressType(AddressType),
-    }
-
-    impl From<Infallible> for MessageSignatureError {
-        fn from(never: Infallible) -> Self { match never {} }
-    }
-
-    impl fmt::Display for MessageSignatureError {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            match self {
-                Self::InvalidLength => write!(f, "length not 65 bytes"),
-                Self::InvalidEncoding(ref e) => write_err!(f, "invalid encoding"; e),
-                Self::InvalidBase64 => write!(f, "invalid base64"),
-                Self::UnsupportedAddressType(ref address_type) =>
-                    write!(f, "unsupported address type: {}", address_type),
-            }
-        }
-    }
-
-    #[cfg(feature = "std")]
-    impl std::error::Error for MessageSignatureError {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            match self {
-                Self::InvalidEncoding(ref e) => Some(e),
-                Self::InvalidLength | Self::InvalidBase64 | Self::UnsupportedAddressType(_) => None,
-            }
-        }
-    }
-
-    impl From<secp256k1::Error> for MessageSignatureError {
-        fn from(e: secp256k1::Error) -> Self { Self::InvalidEncoding(e) }
-    }
+    use crate::crypto::key::LegacyPublicKey;
 
     /// A signature on a Bitcoin Signed Message.
     ///
@@ -130,10 +88,13 @@ mod message_signing {
         pub fn recover_pubkey(
             &self,
             msg_hash: sha256d::Hash,
-        ) -> Result<PublicKey, MessageSignatureError> {
+        ) -> Result<LegacyPublicKey, MessageSignatureError> {
             let msg = secp256k1::Message::from_digest(msg_hash.to_byte_array());
             let pubkey = self.signature.recover_ecdsa(msg)?;
-            Ok(PublicKey { inner: pubkey, compressed: self.compressed })
+            Ok(match self.compressed {
+                true => LegacyPublicKey::from_secp(pubkey),
+                false => LegacyPublicKey::from_secp_uncompressed(pubkey),
+            })
         }
 
         /// Verifies that the signature signs the message and was signed by the given address.
@@ -158,6 +119,8 @@ mod message_signing {
 
     #[cfg(feature = "base64")]
     mod base64_impls {
+        use core::fmt;
+
         use base64::prelude::{Engine as _, BASE64_STANDARD};
 
         use super::*;
@@ -207,17 +170,71 @@ pub fn signed_msg_hash(msg: impl AsRef<[u8]>) -> sha256d::Hash {
 
 /// Sign message using Bitcoin's message signing format.
 #[cfg(feature = "secp-recovery")]
-pub fn sign(msg: impl AsRef<[u8]>, privkey: SecretKey) -> MessageSignature {
-    use secp256k1::ecdsa::RecoverableSignature;
-
+pub fn sign(msg: impl AsRef<[u8]>, privkey: &PrivateKey) -> MessageSignature {
     let msg_hash = signed_msg_hash(msg);
     let msg_to_sign = secp256k1::Message::from_digest(msg_hash.to_byte_array());
-    let secp_sig = RecoverableSignature::sign_ecdsa_recoverable(msg_to_sign, &privkey);
-    MessageSignature { signature: secp_sig, compressed: true }
+    privkey.raw_ecdsa_sign_recoverable(msg_to_sign)
+}
+
+/// Error types for message signing.
+#[cfg(feature = "secp-recovery")]
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    use crate::address::AddressType;
+
+    /// An error used for dealing with Bitcoin Signed Messages.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum MessageSignatureError {
+        /// Signature is expected to be 65 bytes.
+        InvalidLength,
+        /// The signature is invalidly constructed.
+        InvalidEncoding(secp256k1::Error),
+        /// Invalid base64 encoding.
+        InvalidBase64,
+        /// Unsupported Address Type
+        UnsupportedAddressType(AddressType),
+    }
+
+    impl From<Infallible> for MessageSignatureError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for MessageSignatureError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::InvalidLength => write!(f, "length not 65 bytes"),
+                Self::InvalidEncoding(ref e) => write_err!(f, "invalid encoding"; e),
+                Self::InvalidBase64 => write!(f, "invalid base64"),
+                Self::UnsupportedAddressType(ref address_type) =>
+                    write!(f, "unsupported address type: {}", address_type),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for MessageSignatureError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidEncoding(ref e) => Some(e),
+                Self::InvalidLength | Self::InvalidBase64 | Self::UnsupportedAddressType(_) => None,
+            }
+        }
+    }
+
+    impl From<secp256k1::Error> for MessageSignatureError {
+        fn from(e: secp256k1::Error) -> Self { Self::InvalidEncoding(e) }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::*;
 
     #[test]
@@ -230,20 +247,20 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "secp-recovery", feature = "base64", feature = "rand", feature = "std"))]
+    #[cfg(feature = "base64")]
+    #[cfg(feature = "rand")]
+    #[cfg(feature = "secp-recovery")]
+    #[cfg(feature = "std")]
     fn message_signature() {
-        use secp256k1::ecdsa::RecoverableSignature;
-
-        use crate::{Address, AddressType, Network, NetworkKind};
+        use crate::{Address, AddressType, FullPublicKey, Network, NetworkKind, PrivateKey};
 
         let message = "rust-bitcoin MessageSignature test";
         let msg_hash = super::signed_msg_hash(message);
         let msg = secp256k1::Message::from_digest(msg_hash.to_byte_array());
-        let privkey = secp256k1::SecretKey::new(&mut secp256k1::rand::rng());
-        let secp_sig = RecoverableSignature::sign_ecdsa_recoverable(msg, &privkey);
-        let signature = super::MessageSignature { signature: secp_sig, compressed: true };
+        let privkey = PrivateKey::generate();
+        let signature = privkey.raw_ecdsa_sign_recoverable(msg);
 
-        assert_eq!(signature.to_string(), super::sign(message, privkey).to_string());
+        assert_eq!(signature.to_string(), super::sign(message, &privkey).to_string());
         assert_eq!(signature.to_base64(), signature.to_string());
         let signature2 = &signature.to_string().parse::<super::MessageSignature>().unwrap();
         let pubkey = signature2
@@ -267,7 +284,7 @@ mod tests {
         let p2pkh = Address::p2pkh(pubkey, Network::Bitcoin);
         assert_eq!(signature2.is_signed_by_address(&p2pkh, msg_hash), Ok(true));
 
-        assert_eq!(pubkey.to_inner(), secp256k1::PublicKey::from_secret_key(&privkey));
+        assert_eq!(pubkey, FullPublicKey::from_private_key(&privkey).unwrap());
         let signature_base64 = signature.to_base64();
         let signature_round_trip =
             super::MessageSignature::from_base64(&signature_base64).expect("message signature");
@@ -275,11 +292,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "secp-recovery", feature = "base64"))]
+    #[cfg(feature = "base64")]
+    #[cfg(feature = "secp-recovery")]
     fn incorrect_message_signature() {
         use base64::prelude::{Engine as _, BASE64_STANDARD};
 
-        use crate::crypto::key::PublicKey;
+        use crate::crypto::key::LegacyPublicKey;
         use crate::{Address, NetworkKind};
 
         let message = "a different message from what was signed";
@@ -292,9 +310,10 @@ mod tests {
         let signature =
             super::MessageSignature::from_base64(signature_base64).expect("message signature");
 
-        let pubkey =
-            PublicKey::from_slice(&BASE64_STANDARD.decode(pubkey_base64).expect("base64 string"))
-                .expect("pubkey slice");
+        let pubkey = LegacyPublicKey::from_slice(
+            &BASE64_STANDARD.decode(pubkey_base64).expect("base64 string"),
+        )
+        .expect("pubkey slice");
 
         let p2pkh = Address::p2pkh(pubkey, NetworkKind::Main);
         assert_eq!(signature.is_signed_by_address(&p2pkh, msg_hash), Ok(false));

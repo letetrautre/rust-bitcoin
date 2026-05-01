@@ -9,13 +9,15 @@
 //! ### Creating a new address from a randomly-generated key pair.
 //!
 //! ```rust
-//! #[cfg(all(feature = "rand", feature = "std"))] {
+//! #[cfg(feature = "rand")]
+//! #[cfg(feature = "std")]
+//! {
 //! use bitcoin::secp256k1::rand;
-//! use bitcoin::{Address, Network, PublicKey};
+//! use bitcoin::{Address, Network, LegacyPublicKey};
 //!
 //! // Generate random key pair.
 //! let (_sk, pk) = secp256k1::generate_keypair(&mut rand::rng());
-//! let public_key = PublicKey::new(pk); // Or `PublicKey::from(pk)`.
+//! let public_key = LegacyPublicKey::from_secp(pk); // Or `LegacyPublicKey::from(pk)`.
 //!
 //! // Generate a mainnet pay-to-pubkey-hash address.
 //! let address = Address::p2pkh(&public_key, Network::Bitcoin);
@@ -54,7 +56,7 @@ use crate::constants::{
     SCRIPT_ADDRESS_PREFIX_TEST,
 };
 use crate::crypto::key::{
-    CompressedPublicKey, PubkeyHash, PublicKey, TweakedPublicKey, UntweakedPublicKey,
+    FullPublicKey, LegacyPublicKey, PubkeyHash, TweakedPublicKey, UntweakedPublicKey,
     XOnlyPublicKey,
 };
 use crate::network::{Network, NetworkKind, Params};
@@ -69,7 +71,7 @@ use crate::script::{
 use crate::taproot::TapNodeHash;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
-#[doc(inline)]
+#[doc(no_inline)]
 pub use self::error::{
         Base58Error, Bech32Error, FromScriptError, InvalidBase58PayloadLengthError,
         InvalidLegacyPrefixError, LegacyAddressTooLongError, NetworkValidationError,
@@ -308,7 +310,8 @@ pub enum AddressData {
     },
 }
 
-internals::transparent_newtype! {
+// Defined in `REPO_DIR/include/newtype.rs`.
+transparent_newtype! {
     /// A Bitcoin address.
     ///
     /// # Parsing addresses
@@ -529,7 +532,7 @@ impl Address {
     /// Constructs a new pay-to-witness-public-key-hash (P2WPKH) [`Address`] from a public key.
     ///
     /// This is the native SegWit address type for an output redeemable with a single signature.
-    pub fn p2wpkh(pk: CompressedPublicKey, hrp: impl Into<KnownHrp>) -> Self {
+    pub fn p2wpkh(pk: FullPublicKey, hrp: impl Into<KnownHrp>) -> Self {
         let program = WitnessProgram::p2wpkh(pk);
         Self::from_witness_program(program, hrp)
     }
@@ -538,7 +541,7 @@ impl Address {
     /// pay-to-witness-public-key-hash (P2WPKH).
     ///
     /// This is a SegWit address type that looks familiar (as p2sh) to legacy clients.
-    pub fn p2shwpkh(pk: CompressedPublicKey, network: impl Into<NetworkKind>) -> Self {
+    pub fn p2shwpkh(pk: FullPublicKey, network: impl Into<NetworkKind>) -> Self {
         let builder = ScriptPubKey::builder().push_int_unchecked(0).push_slice(pk.wpubkey_hash());
         let script_hash = builder.as_script().script_hash().expect("script is less than 520 bytes");
         Self::p2sh_from_hash(script_hash, network)
@@ -743,7 +746,7 @@ impl Address {
     /// # let address = ADDRESS.parse::<bitcoin::Address<_>>().unwrap().assume_checked();
     /// # let mut writer = String::new();
     /// # // magic trick to make error handling look better
-    /// # (|| -> Result<(), core::fmt::Error> {
+    /// # (|| -> core::fmt::Result {
     ///
     /// write!(writer, "{:#}", address)?;
     ///
@@ -758,13 +761,13 @@ impl Address {
     /// This is determined by directly comparing the address payload with either the
     /// hash of the given public key or the SegWit redeem hash generated from the
     /// given key. For Taproot addresses, the supplied key is assumed to be tweaked
-    pub fn is_related_to_pubkey(&self, pubkey: PublicKey) -> bool {
+    pub fn is_related_to_pubkey(&self, pubkey: LegacyPublicKey) -> bool {
         let pubkey_hash = pubkey.pubkey_hash();
         let payload = self.payload_as_bytes();
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
 
         (*pubkey_hash.as_byte_array() == *payload)
-            || (xonly_pubkey.serialize() == *payload)
+            || (xonly_pubkey.serialize().0 == *payload)
             || (*segwit_redeem_hash(pubkey_hash).as_byte_array() == *payload)
     }
 
@@ -773,7 +776,7 @@ impl Address {
     /// This will only work for Taproot addresses. The Public Key is
     /// assumed to have already been tweaked.
     pub fn is_related_to_xonly_pubkey(&self, xonly_pubkey: XOnlyPublicKey) -> bool {
-        xonly_pubkey.serialize() == *self.payload_as_bytes()
+        xonly_pubkey.serialize().0 == *self.payload_as_bytes()
     }
 
     /// Returns true if the address creates a particular script
@@ -1023,12 +1026,14 @@ fn segwit_redeem_hash(pubkey_hash: PubkeyHash) -> hash160::Hash {
 
 #[cfg(test)]
 mod tests {
-    use hex_lit::hex;
+    use alloc::string::ToString;
+
+    use hex_unstable::hex;
 
     use super::*;
     use crate::network::Network::{Bitcoin, Testnet};
     use crate::network::{params, TestnetVersion};
-    use crate::script::{RedeemScriptBuf, ScriptBufExt as _, WitnessScriptBuf};
+    use crate::script::{RedeemScriptBuf, WitnessScriptBuf};
 
     fn roundtrips(addr: &Address, network: Network) {
         assert_eq!(
@@ -1073,12 +1078,12 @@ mod tests {
 
     #[test]
     fn p2pkh_from_key() {
-        let key = "048d5141948c1702e8c95f438815794b87f706a8d4cd2bffad1dc1570971032c9b6042a0431ded2478b5c9cf2d81c124a5e57347a3c63ef0e7716cf54d613ba183".parse::<PublicKey>().unwrap();
+        let key = "048d5141948c1702e8c95f438815794b87f706a8d4cd2bffad1dc1570971032c9b6042a0431ded2478b5c9cf2d81c124a5e57347a3c63ef0e7716cf54d613ba183".parse::<LegacyPublicKey>().unwrap();
         let addr = Address::p2pkh(key, NetworkKind::Main);
         assert_eq!(&addr.to_string(), "1QJVDzdqb1VpbDK7uDeyVXy9mR27CJiyhY");
 
         let key = "03df154ebfcf29d29cc10d5c2565018bce2d9edbab267c31d2caf44a63056cf99f"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .unwrap();
         let addr = Address::p2pkh(key, NetworkKind::Test);
         assert_eq!(&addr.to_string(), "mqkhEMH6NCeYjFybv7pvFC22MFeaNT9AQC");
@@ -1123,7 +1128,7 @@ mod tests {
     fn p2wpkh() {
         // stolen from Bitcoin transaction: b3c8c2b6cfc335abbcb2c7823a8453f55d64b2b5125a9a61e8737230cdb8ce20
         let key = "033bc8c83c52df5712229a2f72206d90192366c36428cb0c12b6af98324d97bfbc"
-            .parse::<CompressedPublicKey>()
+            .parse::<FullPublicKey>()
             .unwrap();
         let addr = Address::p2wpkh(key, KnownHrp::Mainnet);
         assert_eq!(&addr.to_string(), "bc1qvzvkjn4q3nszqxrv3nraga2r822xjty3ykvkuw");
@@ -1148,7 +1153,7 @@ mod tests {
     fn p2shwpkh() {
         // stolen from Bitcoin transaction: ad3fd9c6b52e752ba21425435ff3dd361d6ac271531fc1d2144843a9f550ad01
         let key = "026c468be64d22761c30cd2f12cbc7de255d592d7904b1bab07236897cc4c2e766"
-            .parse::<CompressedPublicKey>()
+            .parse::<FullPublicKey>()
             .unwrap();
         let addr = Address::p2shwpkh(key, NetworkKind::Main);
         assert_eq!(&addr.to_string(), "3QBRmWNqqBGme9er7fMkGqtZtp4gjMFxhE");
@@ -1373,13 +1378,13 @@ mod tests {
             .expect("mainnet");
 
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
 
         let result = address.is_related_to_pubkey(pubkey);
         assert!(result);
 
         let unused_pubkey = "02ba604e6ad9d3864eda8dc41c62668514ef7d5417d3b6db46e45cc4533bff001c"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .expect("pubkey");
         assert!(!address.is_related_to_pubkey(unused_pubkey))
     }
@@ -1394,13 +1399,13 @@ mod tests {
             .expect("mainnet");
 
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
 
         let result = address.is_related_to_pubkey(pubkey);
         assert!(result);
 
         let unused_pubkey = "02ba604e6ad9d3864eda8dc41c62668514ef7d5417d3b6db46e45cc4533bff001c"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .expect("pubkey");
         assert!(!address.is_related_to_pubkey(unused_pubkey))
     }
@@ -1415,13 +1420,13 @@ mod tests {
             .expect("mainnet");
 
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
 
         let result = address.is_related_to_pubkey(pubkey);
         assert!(result);
 
         let unused_pubkey = "02ba604e6ad9d3864eda8dc41c62668514ef7d5417d3b6db46e45cc4533bff001c"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .expect("pubkey");
         assert!(!address.is_related_to_pubkey(unused_pubkey))
     }
@@ -1436,13 +1441,13 @@ mod tests {
             .expect("testnet");
 
         let pubkey_string = "04e96e22004e3db93530de27ccddfdf1463975d2138ac018fc3e7ba1a2e5e0aad8e424d0b55e2436eb1d0dcd5cb2b8bcc6d53412c22f358de57803a6a655fbbd04";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
 
         let result = address.is_related_to_pubkey(pubkey);
         assert!(result);
 
         let unused_pubkey = "02ba604e6ad9d3864eda8dc41c62668514ef7d5417d3b6db46e45cc4533bff001c"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .expect("pubkey");
         assert!(!address.is_related_to_pubkey(unused_pubkey))
     }
@@ -1450,8 +1455,8 @@ mod tests {
     #[test]
     fn is_related_to_pubkey_p2tr() {
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
         let tweaked_pubkey = TweakedPublicKey::dangerous_assume_tweaked(xonly_pubkey);
         let address = Address::p2tr_tweaked(tweaked_pubkey, KnownHrp::Mainnet);
 
@@ -1468,7 +1473,7 @@ mod tests {
         assert!(result);
 
         let unused_pubkey = "02ba604e6ad9d3864eda8dc41c62668514ef7d5417d3b6db46e45cc4533bff001c"
-            .parse::<PublicKey>()
+            .parse::<LegacyPublicKey>()
             .expect("pubkey");
         assert!(!address.is_related_to_pubkey(unused_pubkey));
     }
@@ -1476,8 +1481,8 @@ mod tests {
     #[test]
     fn is_related_to_xonly_pubkey() {
         let pubkey_string = "0347ff3dacd07a1f43805ec6808e801505a6e18245178609972a68afbc2777ff2b";
-        let pubkey = pubkey_string.parse::<PublicKey>().expect("pubkey");
-        let xonly_pubkey = XOnlyPublicKey::from(pubkey.inner);
+        let pubkey = pubkey_string.parse::<LegacyPublicKey>().expect("pubkey");
+        let xonly_pubkey = XOnlyPublicKey::from(pubkey);
         let tweaked_pubkey = TweakedPublicKey::dangerous_assume_tweaked(xonly_pubkey);
         let address = Address::p2tr_tweaked(tweaked_pubkey, KnownHrp::Mainnet);
 

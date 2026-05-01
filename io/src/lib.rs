@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin I/O Library
+//! # Rust Bitcoin I/O Library
 //!
 //! The [`std::io`] module is not exposed in `no-std` Rust so building `no-std` applications which
 //! require reading and writing objects via standard traits is not generally possible. Thus, this
@@ -13,38 +13,43 @@
 //! For examples of how to use and implement the types and traits in this crate see `io.rs` in the
 //! `github.com/rust-bitcoin/rust-bitcoin/bitcoin/examples/` directory.
 
-#![cfg_attr(not(feature = "std"), no_std)]
+#![no_std]
 // Coding conventions.
 #![warn(missing_docs)]
 #![doc(test(attr(warn(unused))))]
 // Pedantic lints that we enforce.
 #![warn(clippy::return_self_not_must_use)]
-// Exclude lints we don't think are valuable.
-#![allow(clippy::needless_question_mark)] // https://github.com/rust-bitcoin/rust-bitcoin/pull/2134
-#![allow(clippy::manual_range_contains)] // More readable than clippy's format.
-#![allow(clippy::uninlined_format_args)] // Allow `format!("{}", x)` instead of enforcing `format!("{x}")`
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+
+#[cfg(feature = "std")]
+extern crate std;
+
+pub extern crate encoding;
 
 #[cfg(feature = "hashes")]
 pub extern crate hashes;
 
 #[cfg(feature = "std")]
 mod bridge;
-mod error;
+pub mod error;
 
 #[cfg(feature = "hashes")]
 mod hash;
 
-#[cfg(all(not(feature = "std"), feature = "alloc"))]
+#[cfg(feature = "alloc")]
+#[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 use core::cmp;
+#[cfg(feature = "std")]
+use std::vec::Vec;
 
-use encoding::{Decodable, Decoder, Encoder};
+use encoding::{Decode, Decoder, Encoder};
 
 #[rustfmt::skip]                // Keep public re-exports separate.
-pub use self::error::{Error, ErrorKind};
+#[doc(no_inline)]
+pub use self::error::{Error, ErrorKind, ReadError};
 #[cfg(feature = "std")]
 pub use self::bridge::{FromStd, ToStd};
 #[cfg(feature = "hashes")]
@@ -62,6 +67,10 @@ pub trait Read {
     /// # Returns
     ///
     /// The number of bytes read if successful or an [`Error`] if reading fails.
+    ///
+    /// # Errors
+    ///
+    /// If the underlying reader encounters an I/O error.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
 
     /// Reads bytes from source until `buf` is full.
@@ -101,6 +110,10 @@ pub trait Read {
     /// # Returns
     ///
     /// The number of bytes read if successful or an [`Error`] if reading fails.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while reading from the underlying reader.
     #[doc(alias = "read_to_end")]
     #[cfg(feature = "alloc")]
     #[inline]
@@ -143,6 +156,10 @@ impl<R: Read> Take<R> {
     /// # Returns
     ///
     /// The number of bytes read if successful or an [`Error`] if reading fails.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while reading from the underlying reader.
     #[cfg(feature = "alloc")]
     #[inline]
     pub fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
@@ -330,13 +347,25 @@ impl<T: AsMut<[u8]>> Write for Cursor<T> {
 /// See [`std::io::Write`] for more information.
 pub trait Write {
     /// Writes `buf` into this writer, returning how many bytes were written.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while writing to the underlying writer.
     fn write(&mut self, buf: &[u8]) -> Result<usize>;
 
     /// Flushes this output stream, ensuring that all intermediately buffered contents
     /// reach their destination.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while flushing the underlying writer.
     fn flush(&mut self) -> Result<()>;
 
     /// Attempts to write an entire buffer into this writer.
+    ///
+    /// # Errors
+    ///
+    /// If an I/O error occurs while writing to the underlying writer.
     #[inline]
     fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
         while !buf.is_empty() {
@@ -424,13 +453,32 @@ pub const fn from_std<T>(std_io: T) -> FromStd<T> { FromStd::new(std_io) }
 #[inline]
 pub fn from_std_mut<T>(std_io: &mut T) -> &mut FromStd<T> { FromStd::new_mut(std_io) }
 
-/// Encodes a consensus_encoding object to an I/O writer.
-pub fn encode_to_writer<T, W>(object: &T, mut writer: W) -> Result<()>
+/// Encodes a `consensus_encoding` object to an I/O writer.
+///
+/// # Errors
+///
+/// If an I/O error occurs while writing to the underlying writer.
+pub fn encode_to_writer<T, W>(object: &T, writer: W) -> Result<()>
 where
-    T: encoding::Encodable + ?Sized,
+    T: encoding::Encode + ?Sized,
     W: Write,
 {
     let mut encoder = object.encoder();
+    drain_to_writer(&mut encoder, writer)
+}
+
+/// Drains the output of an [`Encoder`] to an I/O writer.
+///
+/// See [`encode_to_writer`] for more information.
+///
+/// # Errors
+///
+/// Returns any I/O error encountered while writing to the writer.
+pub fn drain_to_writer<T, W>(encoder: &mut T, mut writer: W) -> Result<()>
+where
+    T: Encoder + ?Sized,
+    W: Write,
+{
     loop {
         writer.write_all(encoder.current_chunk())?;
         if !encoder.advance() {
@@ -456,7 +504,7 @@ pub fn decode_from_read<T, R>(
     mut reader: R,
 ) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
 where
-    T: Decodable,
+    T: Decode,
     R: BufRead,
 {
     let mut decoder = T::decoder();
@@ -507,7 +555,7 @@ pub fn decode_from_read_unbuffered<T, R>(
     reader: R,
 ) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
 where
-    T: Decodable,
+    T: Decode,
     R: Read,
 {
     decode_from_read_unbuffered_with::<T, R, 4096>(reader)
@@ -534,7 +582,7 @@ pub fn decode_from_read_unbuffered_with<T, R, const BUFFER_SIZE: usize>(
     mut reader: R,
 ) -> core::result::Result<T, ReadError<<T::Decoder as Decoder>::Error>>
 where
-    T: Decodable,
+    T: Decode,
     R: Read,
 {
     let mut decoder = T::decoder();
@@ -566,46 +614,16 @@ where
     decoder.end().map_err(ReadError::Decode)
 }
 
-/// An error that can occur when reading and decoding from a buffered reader.
-#[derive(Debug)]
-pub enum ReadError<D> {
-    /// An I/O error occurred while reading from the reader.
-    Io(Error),
-    /// The decoder encountered an error while parsing the data.
-    Decode(D),
-}
-
-impl<D: core::fmt::Display> core::fmt::Display for ReadError<D> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "I/O error: {}", e),
-            Self::Decode(e) => write!(f, "decode error: {}", e),
-        }
-    }
-}
-
 #[cfg(feature = "std")]
-impl<D> std::error::Error for ReadError<D>
-where
-    D: core::fmt::Debug + core::fmt::Display + std::error::Error + 'static,
-{
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            Self::Decode(e) => Some(e),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl<D> From<Error> for ReadError<D> {
-    fn from(e: Error) -> Self { Self::Io(e) }
-}
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(not(feature = "std"), feature = "alloc"))]
+    #[cfg(feature = "alloc")]
+    #[cfg(not(feature = "std"))]
     use alloc::{string::ToString, vec};
+    #[cfg(feature = "std")]
+    use std::{string::ToString, vec};
 
     use encoding::{ArrayDecoder, ArrayEncoder, UnexpectedEofError};
 
@@ -642,7 +660,7 @@ mod tests {
         // 32 is greater than the reader length.
         let read = reader.read_to_limit(&mut buf, 32).expect("failed to read to limit");
         assert_eq!(read, s.len());
-        assert_eq!(&buf, s.as_bytes())
+        assert_eq!(&buf, s.as_bytes());
     }
 
     #[test]
@@ -654,7 +672,7 @@ mod tests {
 
         let read = reader.read_to_limit(&mut buf, 2).expect("failed to read to limit");
         assert_eq!(read, 2);
-        assert_eq!(&buf, "16".as_bytes())
+        assert_eq!(&buf, "16".as_bytes());
     }
 
     #[test]
@@ -759,10 +777,10 @@ mod tests {
         assert_eq!(cursor.position(), 15);
     }
 
-    // Simple test type that implements Encodable.
+    // Simple test type that implements Encode.
     struct TestData(u32);
 
-    impl encoding::Encodable for TestData {
+    impl encoding::Encode for TestData {
         type Encoder<'e>
             = ArrayEncoder<4>
         where
@@ -786,7 +804,7 @@ mod tests {
     #[derive(Debug, PartialEq)]
     struct TestArray([u8; 4]);
 
-    impl Decodable for TestArray {
+    impl Decode for TestArray {
         type Decoder = TestArrayDecoder;
         fn decoder() -> Self::Decoder { TestArrayDecoder { inner: ArrayDecoder::new() } }
     }

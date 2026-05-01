@@ -6,11 +6,11 @@
 //! conform to Bitcoin consensus.
 
 pub mod encode;
-mod error;
-#[cfg(kani)]
-mod verification;
+pub mod error;
 #[cfg(feature = "serde")]
 pub mod serde;
+#[cfg(kani)]
+mod verification;
 
 use core::fmt;
 
@@ -22,9 +22,10 @@ use crate::consensus;
 #[doc(inline)]
 pub use self::{
     encode::{deserialize, deserialize_partial, serialize, Decodable, Encodable, ReadExt, WriteExt},
-    error::{Error, FromHexError, DecodeError, ParseError, DeserializeError},
 };
 pub(crate) use self::error::parse_failed_error;
+#[doc(no_inline)]
+pub use self::error::{DecodeError, DeserializeError, Error, FromHexError, ParseError};
 
 struct IterReader<E: fmt::Debug, I: Iterator<Item = Result<u8, E>>> {
     iterator: core::iter::Fuse<I>,

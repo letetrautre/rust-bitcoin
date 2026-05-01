@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Rust Bitcoin Hashes Library
+//! # Rust Bitcoin Hashes Library
 //!
 //! This library implements the hash functions needed by Bitcoin. As an ancillary thing, it exposes
 //! hexadecimal serialization and deserialization, since these are needed to display hashes.
@@ -32,7 +32,7 @@
 //! ```
 //!
 //!
-//! Hashing content using [`std::io::Write`] on a `HashEngine`:
+//! Hashing content using [`std::io::Write`] on a [`HashEngine`]:
 //!
 //! ```
 //! # #[cfg(feature = "std")] {
@@ -72,20 +72,23 @@ extern crate core;
 #[cfg(feature = "std")]
 extern crate std;
 
-/// A generic serialization/deserialization framework.
 #[cfg(feature = "serde")]
 pub extern crate serde;
 
-#[cfg(all(test, feature = "serde"))]
+#[cfg(feature = "serde")]
+#[cfg(test)]
 extern crate serde_test;
 
-/// Re-export the `hex-conservative` crate.
+pub extern crate encoding;
+
 #[cfg(feature = "hex")]
-pub extern crate hex;
+pub extern crate hex_stable as hex;
+#[cfg(feature = "hex")]
+pub extern crate hex_unstable;
 
 #[doc(hidden)]
 pub mod _export {
-    /// A re-export of core::*
+    /// A re-export of `core::*`
     pub mod _core {
         pub use core::*;
     }
@@ -125,7 +128,7 @@ pub use self::{
 /// HASH-160: Alias for the [`hash160::Hash`] hash type.
 #[doc(inline)]
 pub use hash160::Hash as Hash160;
-/// MuHash3072: Alias for the [`muhash::Hash`] hash type.
+/// `MuHash3072`: Alias for the [`muhash::Hash`] hash type.
 #[doc(inline)]
 pub use muhash::Hash as MuHash;
 /// RIPEMD-160: Alias for the [`ripemd160::Hash`] hash type.
@@ -144,6 +147,7 @@ pub use sha256d::Hash as Sha256d;
 #[doc(inline)]
 pub use sha384::Hash as Sha384;
 /// SHA3-256: Alias for the [`sha3_256::Hash`] hash type.
+#[doc(inline)]
 pub use sha3_256::Hash as Sha3_256;
 /// SHA-512: Alias for the [`sha512::Hash`] hash type.
 #[doc(inline)]
@@ -175,7 +179,7 @@ pub trait HashEngine: Clone {
     /// The `Hash` type returned when finalizing this engine.
     type Hash: Hash;
 
-    /// The byte array that is used internally in `finalize`.
+    /// The byte array that is used internally in [`HashEngine::finalize`].
     type Bytes: Copy + IsByteArray;
 
     /// Length of the hash, in bytes.
@@ -195,12 +199,9 @@ pub trait HashEngine: Clone {
 }
 
 /// Encodes an object into a hash engine.
-///
-/// Consumes and returns the hash engine to make it easier to call
-/// [`HashEngine::finalize`] directly on the result.
-pub fn encode_to_engine<T, H>(object: &T, mut engine: H) -> H
+pub fn encode_to_engine<T, H>(object: &T, engine: &mut H)
 where
-    T: encoding::Encodable + ?Sized,
+    T: encoding::Encode + ?Sized,
     H: HashEngine,
 {
     let mut encoder = object.encoder();
@@ -210,7 +211,6 @@ where
             break;
         }
     }
-    engine
 }
 
 /// Trait which applies to hashes of all types.
@@ -254,8 +254,27 @@ mod sealed {
     impl<const N: usize> IsByteArray for [u8; N] {}
 }
 
+/// Does a best attempt at erasing the contents of `val` by writing zeros.
+///
+/// The implementation is based on the approach used by the [`zeroize`](https://docs.rs/zeroize)
+/// crate and the `non_secure_erase` functions in `rust-secp256k1`.
+///
+/// Note, however, that the compiler is allowed to freely copy or move the contents of `val` to
+/// other places in memory. Preventing this behavior is very subtle. For more discussion on this,
+/// please see the documentation of the [`zeroize`](https://docs.rs/zeroize) crate.
+pub(crate) fn non_secure_erase<T: ?Sized>(val: &mut T) {
+    use core::sync::atomic;
+
+    let ptr = (val as *mut T).cast::<u8>();
+    let len = core::mem::size_of_val(val);
+    for i in 0..len {
+        unsafe { core::ptr::write_volatile(ptr.add(i), 0) };
+    }
+    atomic::compiler_fence(atomic::Ordering::SeqCst);
+}
+
 fn incomplete_block_len<H: HashEngine>(eng: &H) -> usize {
-    let block_size = <H as HashEngine>::BLOCK_SIZE as u64; // Cast usize to u64 is ok.
+    let block_size = H::BLOCK_SIZE as u64; // Cast usize to u64 is ok.
 
     // After modulo operation we know cast u64 to usize as ok.
     (eng.n_bytes_hashed() % block_size) as usize
@@ -265,17 +284,27 @@ fn incomplete_block_len<H: HashEngine>(eng: &H) -> usize {
 ///
 /// For when we cannot rely on having the `hex` feature enabled. Ignores formatter options and just
 /// writes with plain old `f.write_char()`.
-pub fn debug_hex<'a>(bytes: impl IntoIterator<Item = &'a u8>, f: &mut fmt::Formatter) -> fmt::Result {
+///
+/// # Errors
+///
+/// Returns an error if writing to the formatter fails.
+#[doc(hidden)]
+pub fn debug_hex<'a>(
+    bytes: impl IntoIterator<Item = &'a u8>,
+    f: &mut fmt::Formatter,
+) -> fmt::Result {
     const HEX_TABLE: [u8; 16] = *b"0123456789abcdef";
 
     for &b in bytes {
         let lower = HEX_TABLE[usize::from(b >> 4)];
-        let upper = HEX_TABLE[usize::from(b & 0b00001111)];
+        let upper = HEX_TABLE[usize::from(b & 0b0000_1111)];
         f.write_char(char::from(lower))?;
         f.write_char(char::from(upper))?;
     }
     Ok(())
 }
+
+include!("../include/newtype.rs"); // Explained in `REPO_DIR/docs/README.md`.
 
 #[cfg(test)]
 mod tests {
@@ -311,6 +340,6 @@ mod tests {
         let orig = DUMMY;
         let hex = format!("{}", orig);
         let roundtrip = hex.parse::<TestNewtype>().expect("failed to parse hex");
-        assert_eq!(roundtrip, orig)
+        assert_eq!(roundtrip, orig);
     }
 }

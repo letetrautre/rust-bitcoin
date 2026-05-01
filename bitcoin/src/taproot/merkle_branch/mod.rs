@@ -58,7 +58,9 @@ impl fmt::Display for DecodeError {
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for DecodeError {}
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+}
 
 impl From<DecodeError> for TaprootError {
     fn from(value: DecodeError) -> Self {

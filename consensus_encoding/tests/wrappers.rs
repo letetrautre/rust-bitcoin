@@ -3,7 +3,7 @@
 #![cfg(feature = "std")]
 
 use bitcoin_consensus_encoding as encoding;
-use encoding::{ArrayEncoder, BytesEncoder, CompactSizeEncoder, Encodable, Encoder2, SliceEncoder};
+use encoding::{ArrayEncoder, BytesEncoder, CompactSizeEncoder, Encode, Encoder2, SliceEncoder};
 
 encoding::encoder_newtype_exact! {
     /// An encoder that uses an inner `ArrayEncoder`.
@@ -20,7 +20,7 @@ fn array_encoder() {
     #[derive(Debug, Default, Clone)]
     pub struct Test(u32);
 
-    impl Encodable for Test {
+    impl Encode for Test {
         type Encoder<'e> = TestArrayEncoder<'e>;
         fn encoder(&self) -> Self::Encoder<'_> {
             TestArrayEncoder::new(ArrayEncoder::without_length_prefix(self.0.to_le_bytes()))
@@ -40,7 +40,7 @@ fn bytes_encoder_without_length_prefix() {
     #[derive(Debug, Default, Clone)]
     pub struct Test(Vec<u8>);
 
-    impl Encodable for Test {
+    impl Encode for Test {
         type Encoder<'e>
             = TestBytesEncoder<'e>
         where
@@ -67,7 +67,7 @@ fn two_encoder() {
         b: Vec<u8>,
     }
 
-    impl Encodable for Test {
+    impl Encode for Test {
         type Encoder<'e> = Encoder2<TestBytesEncoder<'e>, TestBytesEncoder<'e>>;
 
         fn encoder(&self) -> Self::Encoder<'_> {
@@ -96,7 +96,7 @@ fn slice_encoder() {
         pub struct TestEncoder<'e>(Encoder2<CompactSizeEncoder, SliceEncoder<'e, Inner>>);
     }
 
-    impl Encodable for Test {
+    impl Encode for Test {
         type Encoder<'e>
             = TestEncoder<'e>
         where
@@ -118,7 +118,7 @@ fn slice_encoder() {
         pub struct InnerArrayEncoder<'e>(ArrayEncoder<4>);
     }
 
-    impl Encodable for Inner {
+    impl Encode for Inner {
         type Encoder<'e> = InnerArrayEncoder<'e>;
         fn encoder(&self) -> Self::Encoder<'_> {
             // Big-endian to make reading the test assertion easier.

@@ -5,55 +5,29 @@
 //! Implementation of compact blocks data structure and algorithms.
 
 use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::{convert, fmt, mem};
-#[cfg(feature = "std")]
-use std::error;
+use core::{convert, mem};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 use bitcoin::consensus::encode::{self, Decodable, Encodable, ReadExt, WriteExt};
 use bitcoin::{block, Block, BlockChecked, BlockHash, Transaction};
 use encoding::{
-    CompactSizeDecoder, CompactSizeEncoder, Decoder2, Encoder2, SliceEncoder, VecDecoder,
+    ArrayDecoder, ArrayEncoder, CompactSizeDecoder, CompactSizeEncoder, Decoder2, Decoder4,
+    Encoder2, Encoder4, SliceEncoder, VecDecoder,
 };
 use hashes::{sha256, siphash24};
 use internals::array::ArrayExt as _;
-use internals::write_err;
 use io::{BufRead, Write};
-use primitives::block::{BlockHashDecoder, BlockHashEncoder};
+use primitives::block::{BlockHashDecoder, BlockHashEncoder, Header, HeaderDecoder, HeaderEncoder};
+use primitives::transaction::{TransactionDecoder, TransactionEncoder};
 
-/// A BIP-0152 error
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Error {
-    /// An unknown version number was used.
-    UnknownVersion,
-    /// The prefill slice provided was invalid.
-    InvalidPrefill,
-}
-
-impl From<Infallible> for Error {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Self::UnknownVersion => write!(f, "an unknown version number was used"),
-            Self::InvalidPrefill => write!(f, "the prefill slice provided was invalid"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UnknownVersion | Self::InvalidPrefill => None,
-        }
-    }
-}
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{
+    BlockTransactionsDecoderError, BlockTransactionsRequestDecoderError, Error,
+    HeaderAndShortIdsDecoderError, PrefilledTransactionDecoderError, ShortIdDecoderError,
+    TxIndexOutOfRangeError,
+};
 
 /// A [`PrefilledTransaction`] structure is used in [`HeaderAndShortIds`] to
 /// provide a list of a few transactions explicitly.
@@ -76,6 +50,72 @@ pub struct PrefilledTransaction {
 
 impl convert::AsRef<Transaction> for PrefilledTransaction {
     fn as_ref(&self) -> &Transaction { &self.tx }
+}
+
+encoding::encoder_newtype! {
+    /// The encoder for a [`PrefilledTransaction`] message.
+    #[derive(Debug, Clone)]
+    pub struct PrefilledTransactionEncoder<'e>(Encoder2<CompactSizeEncoder, TransactionEncoder<'e>>);
+}
+
+impl encoding::Encode for PrefilledTransaction {
+    type Encoder<'e>
+        = PrefilledTransactionEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        PrefilledTransactionEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.idx.into()),
+            self.tx.encoder(),
+        ))
+    }
+}
+
+type PrefilledTransactionInnerDecoder = Decoder2<CompactSizeDecoder, TransactionDecoder>;
+
+/// The decoder for a [`PrefilledTransaction`] message.
+#[derive(Debug, Clone)]
+pub struct PrefilledTransactionDecoder(PrefilledTransactionInnerDecoder);
+
+impl PrefilledTransactionDecoder {
+    fn err_from_inner(
+        inner: <PrefilledTransactionInnerDecoder as encoding::Decoder>::Error,
+    ) -> PrefilledTransactionDecoderError {
+        PrefilledTransactionDecoderError::Decoder(inner)
+    }
+}
+
+impl encoding::Decoder for PrefilledTransactionDecoder {
+    type Output = PrefilledTransaction;
+    type Error = PrefilledTransactionDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(Self::err_from_inner)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (cs, tx) = self.0.end().map_err(Self::err_from_inner)?;
+        let idx =
+            u16::try_from(cs).map_err(|_| PrefilledTransactionDecoderError::InvalidIndex(cs))?;
+        Ok(PrefilledTransaction { idx, tx })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for PrefilledTransaction {
+    type Decoder = PrefilledTransactionDecoder;
+
+    fn decoder() -> Self::Decoder {
+        PrefilledTransactionDecoder(Decoder2::new(
+            CompactSizeDecoder::new(),
+            TransactionDecoder::new(),
+        ))
+    }
 }
 
 impl Encodable for PrefilledTransaction {
@@ -152,13 +192,13 @@ impl ShortId {
 
 impl core::fmt::LowerHex for ShortId {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        hex::display::fmt_hex_exact!(f, 6, &self.0, hex::Case::Lower)
+        hex_unstable::display::fmt_hex_exact!(f, 6, &self.0, hex_unstable::Case::Lower)
     }
 }
 
 impl core::fmt::UpperHex for ShortId {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        hex::display::fmt_hex_exact!(f, 6, &self.0, hex::Case::Upper)
+        hex_unstable::display::fmt_hex_exact!(f, 6, &self.0, hex_unstable::Case::Upper)
     }
 }
 
@@ -188,6 +228,51 @@ impl Decodable for ShortId {
     }
 }
 
+encoding::encoder_newtype_exact! {
+    /// Encoder type for a [`ShortId`].
+    #[derive(Debug, Clone)]
+    pub struct ShortIdEncoder<'e>(ArrayEncoder<6>);
+}
+
+impl encoding::Encode for ShortId {
+    type Encoder<'e> = ShortIdEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        ShortIdEncoder::new(ArrayEncoder::without_length_prefix(self.to_byte_array()))
+    }
+}
+
+type ShortIdInnerDecoder = ArrayDecoder<6>;
+
+/// Decoder type for a [`ShortId`].
+#[derive(Debug, Clone)]
+pub struct ShortIdDecoder(ShortIdInnerDecoder);
+
+impl encoding::Decoder for ShortIdDecoder {
+    type Output = ShortId;
+    type Error = ShortIdDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(ShortIdDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let arr = self.0.end().map_err(ShortIdDecoderError)?;
+        Ok(ShortId(arr))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for ShortId {
+    type Decoder = ShortIdDecoder;
+
+    fn decoder() -> Self::Decoder { ShortIdDecoder(ShortIdInnerDecoder::new()) }
+}
+
 /// A structure to relay a block header, short IDs, and a select few transactions.
 ///
 /// A [`HeaderAndShortIds`] structure is used to relay a block header, the short
@@ -205,6 +290,98 @@ pub struct HeaderAndShortIds {
     ///  Used to provide the coinbase transaction and a select few
     ///  which we expect a peer may be missing.
     pub prefilled_txs: Vec<PrefilledTransaction>,
+}
+
+type HeaderAndShortIdsInnerEncoder<'e> = Encoder4<
+    HeaderEncoder<'e>,
+    ArrayEncoder<8>,
+    Encoder2<CompactSizeEncoder, SliceEncoder<'e, ShortId>>,
+    Encoder2<CompactSizeEncoder, SliceEncoder<'e, PrefilledTransaction>>,
+>;
+
+encoding::encoder_newtype! {
+    /// Encoder type for a [`HeaderAndShortIds`] message.
+    #[derive(Debug, Clone)]
+    pub struct HeaderAndShortIdsEncoder<'e>(
+        HeaderAndShortIdsInnerEncoder<'e>
+    );
+}
+
+impl encoding::Encode for HeaderAndShortIds {
+    type Encoder<'e>
+        = HeaderAndShortIdsEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        HeaderAndShortIdsEncoder::new(Encoder4::new(
+            self.header.encoder(),
+            ArrayEncoder::without_length_prefix(self.nonce.to_le_bytes()),
+            Encoder2::new(
+                CompactSizeEncoder::new(self.short_ids.len()),
+                SliceEncoder::without_length_prefix(&self.short_ids),
+            ),
+            Encoder2::new(
+                CompactSizeEncoder::new(self.prefilled_txs.len()),
+                SliceEncoder::without_length_prefix(&self.prefilled_txs),
+            ),
+        ))
+    }
+}
+
+type HeaderAndShortIdsInnerDecoder =
+    Decoder4<HeaderDecoder, ArrayDecoder<8>, VecDecoder<ShortId>, VecDecoder<PrefilledTransaction>>;
+
+/// Decoder type for the [`HeaderAndShortIds`] message.
+#[derive(Debug, Clone)]
+pub struct HeaderAndShortIdsDecoder(HeaderAndShortIdsInnerDecoder);
+
+impl HeaderAndShortIdsDecoder {
+    fn err_from_inner(
+        inner: <HeaderAndShortIdsInnerDecoder as encoding::Decoder>::Error,
+    ) -> HeaderAndShortIdsDecoderError {
+        HeaderAndShortIdsDecoderError::Decoder(inner)
+    }
+}
+
+impl encoding::Decoder for HeaderAndShortIdsDecoder {
+    type Output = HeaderAndShortIds;
+    type Error = HeaderAndShortIdsDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(Self::err_from_inner)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (header, nonce, short_ids, prefilled_txs) =
+            self.0.end().map_err(Self::err_from_inner)?;
+        let overflow_check = short_ids
+            .len()
+            .checked_add(prefilled_txs.len())
+            .ok_or(HeaderAndShortIdsDecoderError::IndexOverflow)?;
+        if overflow_check > u16::MAX.into() {
+            return Err(HeaderAndShortIdsDecoderError::IndexOverflow);
+        }
+        Ok(HeaderAndShortIds { header, nonce: u64::from_le_bytes(nonce), short_ids, prefilled_txs })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for HeaderAndShortIds {
+    type Decoder = HeaderAndShortIdsDecoder;
+
+    fn decoder() -> Self::Decoder {
+        HeaderAndShortIdsDecoder(Decoder4::new(
+            Header::decoder(),
+            ArrayDecoder::new(),
+            VecDecoder::<ShortId>::new(),
+            VecDecoder::<PrefilledTransaction>::new(),
+        ))
+    }
 }
 
 impl Decodable for HeaderAndShortIds {
@@ -321,12 +498,13 @@ impl HeaderAndShortIds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Offset(usize);
 
-impl encoding::Encodable for Offset {
+impl encoding::Encode for Offset {
     type Encoder<'e> = CompactSizeEncoder;
 
     fn encoder(&self) -> Self::Encoder<'_> { CompactSizeEncoder::new(self.0) }
 }
 
+#[derive(Debug, Clone)]
 struct OffsetDecoder(CompactSizeDecoder);
 
 impl encoding::Decoder for OffsetDecoder {
@@ -345,7 +523,7 @@ impl encoding::Decoder for OffsetDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for Offset {
+impl encoding::Decode for Offset {
     type Decoder = OffsetDecoder;
 
     fn decoder() -> Self::Decoder { OffsetDecoder(CompactSizeDecoder::new()) }
@@ -413,6 +591,7 @@ impl BlockTransactionsRequest {
 
 encoding::encoder_newtype! {
     /// The encoder for [`BlockTransactionsRequest`].
+    #[derive(Debug, Clone)]
     pub struct BlockTransactionsRequestEncoder<'e>(
         Encoder2<
             BlockHashEncoder<'e>,
@@ -421,25 +600,24 @@ encoding::encoder_newtype! {
     );
 }
 
-impl encoding::Encodable for BlockTransactionsRequest {
+impl encoding::Encode for BlockTransactionsRequest {
     type Encoder<'e> = BlockTransactionsRequestEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
-        BlockTransactionsRequestEncoder::new(
+        BlockTransactionsRequestEncoder::new(Encoder2::new(
+            self.block_hash.encoder(),
             Encoder2::new(
-                self.block_hash.encoder(),
-                Encoder2::new(
-                    CompactSizeEncoder::new(self.offsets.len()),
-                    SliceEncoder::without_length_prefix(&self.offsets),
-                ),
-            )
-        )
+                CompactSizeEncoder::new(self.offsets.len()),
+                SliceEncoder::without_length_prefix(&self.offsets),
+            ),
+        ))
     }
 }
 
 type BlockTransactionsRequestInnerDecoder = Decoder2<BlockHashDecoder, VecDecoder<Offset>>;
 
 /// The encoder type for a [`BlockTransactionsRequest`].
+#[derive(Debug, Clone)]
 pub struct BlockTransactionsRequestDecoder(BlockTransactionsRequestInnerDecoder);
 
 impl encoding::Decoder for BlockTransactionsRequestDecoder {
@@ -461,33 +639,12 @@ impl encoding::Decoder for BlockTransactionsRequestDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for BlockTransactionsRequest {
+impl encoding::Decode for BlockTransactionsRequest {
     type Decoder = BlockTransactionsRequestDecoder;
 
     fn decoder() -> Self::Decoder {
         BlockTransactionsRequestDecoder(Decoder2::new(BlockHashDecoder::new(), VecDecoder::new()))
     }
-}
-
-/// An error decoding a [`BlockTransactionsRequest`] message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockTransactionsRequestDecoderError(
-    <BlockTransactionsRequestInnerDecoder as encoding::Decoder>::Error,
-);
-
-impl From<Infallible> for BlockTransactionsRequestDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
-}
-
-impl fmt::Display for BlockTransactionsRequestDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "blocktxnrequest error"; self.0)
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for BlockTransactionsRequestDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
 }
 
 impl Encodable for BlockTransactionsRequest {
@@ -534,28 +691,6 @@ impl Decodable for BlockTransactionsRequest {
     }
 }
 
-/// A transaction index is requested that is out of range from the
-/// corresponding block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct TxIndexOutOfRangeError(u64);
-
-impl fmt::Display for TxIndexOutOfRangeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "a transaction index is requested that is \
-            out of range from the corresponding block: {}",
-            self.0,
-        )
-    }
-}
-
-#[cfg(feature = "std")]
-impl error::Error for TxIndexOutOfRangeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
-}
-
 /// A [`BlockTransactions`] structure is used to provide some of the transactions
 /// in a block, as requested.
 #[derive(PartialEq, Eq, Clone, Debug, PartialOrd, Ord, Hash)]
@@ -565,6 +700,71 @@ pub struct BlockTransactions {
     ///  The transactions provided.
     pub transactions: Vec<Transaction>,
 }
+
+encoding::encoder_newtype! {
+    /// Encoder type for [`BlockTransactions`].
+    #[derive(Debug, Clone)]
+    pub struct BlockTransactionsEncoder<'e>(
+        Encoder2<
+            BlockHashEncoder<'e>,
+            Encoder2<CompactSizeEncoder, SliceEncoder<'e, Transaction>>
+        >
+    );
+}
+
+impl encoding::Encode for BlockTransactions {
+    type Encoder<'e>
+        = BlockTransactionsEncoder<'e>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        BlockTransactionsEncoder::new(Encoder2::new(
+            self.block_hash.encoder(),
+            Encoder2::new(
+                CompactSizeEncoder::new(self.transactions.len()),
+                SliceEncoder::without_length_prefix(&self.transactions),
+            ),
+        ))
+    }
+}
+
+type BlockTransactionsInnerDecoder = Decoder2<BlockHashDecoder, VecDecoder<Transaction>>;
+
+/// Decoder type for a [`BlockTransactions`] message.
+#[derive(Debug, Clone)]
+pub struct BlockTransactionsDecoder(BlockTransactionsInnerDecoder);
+
+impl encoding::Decoder for BlockTransactionsDecoder {
+    type Output = BlockTransactions;
+    type Error = BlockTransactionsDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(BlockTransactionsDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (block_hash, transactions) = self.0.end().map_err(BlockTransactionsDecoderError)?;
+        Ok(BlockTransactions { block_hash, transactions })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for BlockTransactions {
+    type Decoder = BlockTransactionsDecoder;
+
+    fn decoder() -> Self::Decoder {
+        BlockTransactionsDecoder(Decoder2::new(
+            BlockHashDecoder::new(),
+            VecDecoder::<Transaction>::new(),
+        ))
+    }
+}
+
 crate::consensus::impl_consensus_encoding!(BlockTransactions, block_hash, transactions);
 
 impl BlockTransactions {
@@ -592,6 +792,204 @@ impl BlockTransactions {
                 txs
             },
         })
+    }
+}
+
+/// Error types for BIP-0152 compact blocks.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    /// A BIP-0152 error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum Error {
+        /// An unknown version number was used.
+        UnknownVersion,
+        /// The prefill slice provided was invalid.
+        InvalidPrefill,
+    }
+
+    impl From<Infallible> for Error {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for Error {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match *self {
+                Self::UnknownVersion => write!(f, "an unknown version number was used"),
+                Self::InvalidPrefill => write!(f, "the prefill slice provided was invalid"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for Error {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::UnknownVersion | Self::InvalidPrefill => None,
+            }
+        }
+    }
+
+    /// An error occuring when decoding a [`PrefilledTransaction`].
+    ///
+    /// [`PrefilledTransaction`]: super::PrefilledTransaction
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PrefilledTransactionDecoderError {
+        /// Inner decoder error.
+        Decoder(<super::PrefilledTransactionInnerDecoder as encoding::Decoder>::Error),
+        /// The differential encoding may be no more than 16 bits.
+        InvalidIndex(usize),
+    }
+
+    impl From<Infallible> for PrefilledTransactionDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for PrefilledTransactionDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Decoder(d) => write_err!(f, "prefilled transaction error"; d),
+                Self::InvalidIndex(idx) => write!(f, "index overflowed u16 {}", idx),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for PrefilledTransactionDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Decoder(d) => Some(d),
+                Self::InvalidIndex(_idx) => None,
+            }
+        }
+    }
+
+    /// An error decoding a [`ShortId`].
+    ///
+    /// [`ShortId`]: super::ShortId
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ShortIdDecoderError(
+        pub(super) <super::ShortIdInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for ShortIdDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for ShortIdDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "shortid error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for ShortIdDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Errors occuring when decoding a [`HeaderAndShortIds`] message.
+    ///
+    /// [`HeaderAndShortIds`]: super::HeaderAndShortIds
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HeaderAndShortIdsDecoderError {
+        /// Inner decoder error.
+        Decoder(<super::HeaderAndShortIdsInnerDecoder as encoding::Decoder>::Error),
+        /// Block indexes overflowed.
+        IndexOverflow,
+    }
+
+    impl From<Infallible> for HeaderAndShortIdsDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for HeaderAndShortIdsDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Decoder(d) => write_err!(f, "headerandshortids error"; d),
+                Self::IndexOverflow => write!(f, "block index overflowed"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for HeaderAndShortIdsDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Decoder(d) => Some(d),
+                Self::IndexOverflow => None,
+            }
+        }
+    }
+
+    /// An error decoding a [`BlockTransactionsRequest`] message.
+    ///
+    /// [`BlockTransactionsRequest`]: super::BlockTransactionsRequest
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BlockTransactionsRequestDecoderError(
+        pub(super) <super::BlockTransactionsRequestInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for BlockTransactionsRequestDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for BlockTransactionsRequestDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "blocktxnrequest error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for BlockTransactionsRequestDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// A transaction index is requested that is out of range from the corresponding block.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct TxIndexOutOfRangeError(pub(super) u64);
+
+    impl fmt::Display for TxIndexOutOfRangeError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "a transaction index is requested that is \
+                out of range from the corresponding block: {}",
+                self.0,
+            )
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for TxIndexOutOfRangeError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
+
+    /// An error occuring decoding a [`BlockTransactions`] message.
+    ///
+    /// [`BlockTransactions`]: super::BlockTransactions
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct BlockTransactionsDecoderError(
+        pub(super) <super::BlockTransactionsInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for BlockTransactionsDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for BlockTransactionsDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "blocktxn error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for BlockTransactionsDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
     }
 }
 
@@ -642,9 +1040,7 @@ impl<'a> Arbitrary<'a> for BlockTransactionsRequest {
 mod test {
     use alloc::vec;
 
-    use bitcoin::consensus::encode::{deserialize, serialize};
     use bitcoin::merkle_tree::TxMerkleNode;
-    use hex::FromHex;
     use primitives::locktime::absolute;
     use primitives::{
         transaction, Amount, BlockChecked, BlockTime, CompactTarget, OutPoint, ScriptPubKeyBuf,
@@ -652,6 +1048,7 @@ mod test {
     };
 
     use super::*;
+    use crate::hex;
 
     fn dummy_tx(nonce: &[u8]) -> Transaction {
         let dummy_txid = Txid::from_byte_array(hashes::sha256::Hash::hash(nonce).to_byte_array());
@@ -704,14 +1101,14 @@ mod test {
     #[test]
     fn compact_block_vector() {
         // Tested with Elements implementation of compact blocks.
-        let raw_block = Vec::<u8>::from_hex("000000206c750a364035aefd5f81508a08769975116d9195312ee4520dceac39e1fdc62c4dc67473b8e354358c1e610afeaff7410858bd45df43e2940f8a62bd3d5e3ac943c2975cffff7f200000000002020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff04016b0101ffffffff020006062a0100000001510000000000000000266a24aa21a9ed4a3d9f3343dafcc0d6f6d4310f2ee5ce273ed34edca6c75db3a73e7f368734200120000000000000000000000000000000000000000000000000000000000000000000000000020000000001021fc20ba2bd745507b8e00679e3b362558f9457db374ca28ffa5243f4c23a4d5f00000000171600147c9dea14ffbcaec4b575e03f05ceb7a81cd3fcbffdffffff915d689be87b43337f42e26033df59807b768223368f189a023d0242d837768900000000171600147c9dea14ffbcaec4b575e03f05ceb7a81cd3fcbffdffffff0200cdf5050000000017a9146803c72d9154a6a20f404bed6d3dcee07986235a8700e1f5050000000017a9144e6a4c7cb5b5562904843bdf816342f4db9f5797870247304402205e9bf6e70eb0e4b495bf483fd8e6e02da64900f290ef8aaa64bb32600d973c450220670896f5d0e5f33473e5f399ab680cc1d25c2d2afd15abd722f04978f28be887012103e4e4d9312b2261af508b367d8ba9be4f01b61d6d6e78bec499845b4f410bcf2702473044022045ac80596a6ac9c8c572f94708709adaf106677221122e08daf8b9741a04f66a022003ccd52a3b78f8fd08058fc04fc0cffa5f4c196c84eae9e37e2a85babe731b57012103e4e4d9312b2261af508b367d8ba9be4f01b61d6d6e78bec499845b4f410bcf276a000000").unwrap();
-        let raw_compact = Vec::<u8>::from_hex("000000206c750a364035aefd5f81508a08769975116d9195312ee4520dceac39e1fdc62c4dc67473b8e354358c1e610afeaff7410858bd45df43e2940f8a62bd3d5e3ac943c2975cffff7f2000000000a4df3c3744da89fa010a6979e971450100020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff04016b0101ffffffff020006062a0100000001510000000000000000266a24aa21a9ed4a3d9f3343dafcc0d6f6d4310f2ee5ce273ed34edca6c75db3a73e7f368734200120000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
+        let raw_block = hex::decode_to_vec("000000206c750a364035aefd5f81508a08769975116d9195312ee4520dceac39e1fdc62c4dc67473b8e354358c1e610afeaff7410858bd45df43e2940f8a62bd3d5e3ac943c2975cffff7f200000000002020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff04016b0101ffffffff020006062a0100000001510000000000000000266a24aa21a9ed4a3d9f3343dafcc0d6f6d4310f2ee5ce273ed34edca6c75db3a73e7f368734200120000000000000000000000000000000000000000000000000000000000000000000000000020000000001021fc20ba2bd745507b8e00679e3b362558f9457db374ca28ffa5243f4c23a4d5f00000000171600147c9dea14ffbcaec4b575e03f05ceb7a81cd3fcbffdffffff915d689be87b43337f42e26033df59807b768223368f189a023d0242d837768900000000171600147c9dea14ffbcaec4b575e03f05ceb7a81cd3fcbffdffffff0200cdf5050000000017a9146803c72d9154a6a20f404bed6d3dcee07986235a8700e1f5050000000017a9144e6a4c7cb5b5562904843bdf816342f4db9f5797870247304402205e9bf6e70eb0e4b495bf483fd8e6e02da64900f290ef8aaa64bb32600d973c450220670896f5d0e5f33473e5f399ab680cc1d25c2d2afd15abd722f04978f28be887012103e4e4d9312b2261af508b367d8ba9be4f01b61d6d6e78bec499845b4f410bcf2702473044022045ac80596a6ac9c8c572f94708709adaf106677221122e08daf8b9741a04f66a022003ccd52a3b78f8fd08058fc04fc0cffa5f4c196c84eae9e37e2a85babe731b57012103e4e4d9312b2261af508b367d8ba9be4f01b61d6d6e78bec499845b4f410bcf276a000000").unwrap();
+        let raw_compact = hex::decode_to_vec("000000206c750a364035aefd5f81508a08769975116d9195312ee4520dceac39e1fdc62c4dc67473b8e354358c1e610afeaff7410858bd45df43e2940f8a62bd3d5e3ac943c2975cffff7f2000000000a4df3c3744da89fa010a6979e971450100020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff04016b0101ffffffff020006062a0100000001510000000000000000266a24aa21a9ed4a3d9f3343dafcc0d6f6d4310f2ee5ce273ed34edca6c75db3a73e7f368734200120000000000000000000000000000000000000000000000000000000000000000000000000").unwrap();
 
-        let block: Block = deserialize(&raw_block).unwrap();
+        let block: Block = encoding::decode_from_slice(&raw_block).unwrap();
         let block = block.assume_checked(None);
         let nonce = 18_053_200_567_810_711_460;
         let compact = HeaderAndShortIds::from_block(&block, nonce, 2, &[]).unwrap();
-        let compact_expected = deserialize(&raw_compact).unwrap();
+        let compact_expected = encoding::decode_from_slice(&raw_compact).unwrap();
 
         assert_eq!(compact, compact_expected);
     }
@@ -735,12 +1132,12 @@ mod test {
                 // test deserialization
                 let mut raw: Vec<u8> = vec![0u8; 32];
                 raw.extend(testcase.0.clone());
-                let btr: BlockTransactionsRequest = deserialize(&raw.clone()).unwrap();
+                let btr: BlockTransactionsRequest = encoding::decode_from_slice(&raw.clone()).unwrap();
                 assert_eq!(testcase.1, btr.indices().unwrap());
             }
             {
                 // test serialization
-                let raw: Vec<u8> = serialize(&&BlockTransactionsRequest::from_indices_unchecked(
+                let raw: Vec<u8> = encoding::encode_to_vec(&BlockTransactionsRequest::from_indices_unchecked(
                     BlockHash::from_byte_array([0; 32]),
                     testcase.1,
                 ));
@@ -754,8 +1151,7 @@ mod test {
                 // test that we return Err() if deserialization fails (and don't panic)
                 let mut raw: Vec<u8> = [0u8; 32].to_vec();
                 raw.extend(errorcase);
-                let get_block_txn = deserialize::<BlockTransactionsRequest>(&raw.clone()).unwrap();
-                assert!(get_block_txn.indices().is_err());
+                assert!(encoding::decode_from_slice::<BlockTransactionsRequest>(&raw).is_err());
             }
         }
     }

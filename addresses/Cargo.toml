@@ -4,6 +4,7 @@ version = "0.0.0"
 authors = ["Andrew Poelstra <apoelstra@wpsoftware.net>"]
 license = "CC0-1.0"
 repository = "https://github.com/rust-bitcoin/rust-bitcoin"
+homepage = "https://rust-bitcoin.org"
 description = "Bitcoin address"
 categories = ["cryptography::cryptocurrencies"]
 keywords = ["bitcoin", "types"]
@@ -25,6 +26,5 @@ alloc = []
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
-[lints.clippy]
-redundant_clone = "warn"
-use_self = "warn"
+[lints]
+workspace = true

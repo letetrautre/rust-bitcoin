@@ -3,8 +3,8 @@
 //! Test composition of encoders and decoders.
 
 use bitcoin_consensus_encoding::{
-    ArrayDecoder, ArrayEncoder, BytesEncoder, Decodable, Decoder, Decoder2, Decoder2Error,
-    Decoder6, Encodable, Encoder, Encoder2, Encoder3, Encoder6, UnexpectedEofError,
+    ArrayDecoder, ArrayEncoder, BytesEncoder, Decode, Decoder, Decoder2, Decoder2Error, Decoder6,
+    Encode, Encoder, Encoder2, Encoder3, Encoder6, UnexpectedEofError,
 };
 
 const EMPTY: &[u8] = &[];
@@ -16,7 +16,7 @@ struct CompositeData {
     second: [u8; 2],
 }
 
-impl Encodable for CompositeData {
+impl Encode for CompositeData {
     type Encoder<'e> = Encoder2<ArrayEncoder<4>, ArrayEncoder<2>>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -76,7 +76,7 @@ impl Decoder for CompositeDataDecoder {
     fn read_limit(&self) -> usize { self.inner.read_limit() }
 }
 
-impl Decodable for CompositeData {
+impl Decode for CompositeData {
     type Decoder = CompositeDataDecoder;
 
     fn decoder() -> Self::Decoder { CompositeDataDecoder::new() }
@@ -338,7 +338,4 @@ fn empty_encoders() {
 
     assert_eq!(encoder.current_chunk(), &[3, 4][..]);
     assert!(!encoder.advance());
-
-    // Exhausted.
-    assert!(encoder.current_chunk().is_empty());
 }

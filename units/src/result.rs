@@ -11,6 +11,10 @@ use NumOpResult as R;
 
 use crate::{Amount, FeeRate, SignedAmount, Weight};
 
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::NumOpError;
+
 /// Result of a mathematical operation on two numeric types.
 ///
 /// In order to prevent overflow we provide a custom result type that is similar to the normal
@@ -271,6 +275,7 @@ crate::internal_macros::impl_op_for_references! {
 
 // Implement AddAssign on NumOpResults for all wrapped types that already implement AddAssign on themselves
 impl<T: ops::AddAssign> ops::AddAssign<T> for NumOpResult<T> {
+    #[inline]
     fn add_assign(&mut self, rhs: T) {
         if let Self::Valid(ref mut lhs) = self {
             *lhs += rhs;
@@ -279,6 +284,7 @@ impl<T: ops::AddAssign> ops::AddAssign<T> for NumOpResult<T> {
 }
 
 impl<T: ops::AddAssign + Copy> ops::AddAssign<Self> for NumOpResult<T> {
+    #[inline]
     fn add_assign(&mut self, rhs: Self) {
         match (&self, rhs) {
             (Self::Valid(_), Self::Valid(rhs)) => *self += rhs,
@@ -289,6 +295,7 @@ impl<T: ops::AddAssign + Copy> ops::AddAssign<Self> for NumOpResult<T> {
 
 // Implement SubAssign on NumOpResults for all wrapped types that already implement SubAssign on themselves
 impl<T: ops::SubAssign> ops::SubAssign<T> for NumOpResult<T> {
+    #[inline]
     fn sub_assign(&mut self, rhs: T) {
         if let Self::Valid(ref mut lhs) = self {
             *lhs -= rhs;
@@ -297,6 +304,7 @@ impl<T: ops::SubAssign> ops::SubAssign<T> for NumOpResult<T> {
 }
 
 impl<T: ops::SubAssign + Copy> ops::SubAssign<Self> for NumOpResult<T> {
+    #[inline]
     fn sub_assign(&mut self, rhs: Self) {
         match (&self, rhs) {
             (Self::Valid(_), Self::Valid(rhs)) => *self -= rhs,
@@ -325,34 +333,6 @@ macro_rules! impl_opt_ext {
     }
 }
 impl_opt_ext!(Amount, SignedAmount, u64, i64, FeeRate, Weight);
-
-/// Error returned when a mathematical operation fails.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct NumOpError(MathOp);
-
-impl NumOpError {
-    /// Constructs a [`NumOpError`] caused by `op`.
-    pub(crate) const fn while_doing(op: MathOp) -> Self { Self(op) }
-
-    /// Returns `true` if this operation error'ed due to overflow.
-    pub fn is_overflow(self) -> bool { self.0.is_overflow() }
-
-    /// Returns `true` if this operation error'ed due to division by zero.
-    pub fn is_div_by_zero(self) -> bool { self.0.is_div_by_zero() }
-
-    /// Returns the [`MathOp`] that caused this error.
-    pub fn operation(self) -> MathOp { self.0 }
-}
-
-impl fmt::Display for NumOpError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "math operation '{}' gave an invalid numeric result", self.operation())
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for NumOpError {}
 
 /// The math operation that caused the error.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -383,18 +363,23 @@ impl MathOp {
     }
 
     /// Returns `true` if this operation error'ed due to division by zero.
+    #[inline]
     pub fn is_div_by_zero(self) -> bool { !self.is_overflow() }
 
     /// Returns `true` if this operation error'ed due to addition.
+    #[inline]
     pub fn is_addition(self) -> bool { self == Self::Add }
 
     /// Returns `true` if this operation error'ed due to subtraction.
+    #[inline]
     pub fn is_subtraction(self) -> bool { self == Self::Sub }
 
     /// Returns `true` if this operation error'ed due to multiplication.
+    #[inline]
     pub fn is_multiplication(self) -> bool { self == Self::Mul }
 
     /// Returns `true` if this operation error'ed due to negation.
+    #[inline]
     pub fn is_negation(self) -> bool { self == Self::Neg }
 }
 
@@ -409,6 +394,53 @@ impl fmt::Display for MathOp {
             Self::Neg => write!(f, "neg"),
             Self::_DoNotUse(infallible) => match infallible {},
         }
+    }
+}
+
+/// Error types for mathematical operations.
+pub mod error {
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use super::MathOp;
+
+    /// Error returned when a mathematical operation fails.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct NumOpError(pub(super) MathOp);
+
+    impl NumOpError {
+        /// Constructs a [`NumOpError`] caused by `op`.
+        #[inline]
+        pub(crate) const fn while_doing(op: MathOp) -> Self { Self(op) }
+
+        /// Returns `true` if this operation error'ed due to overflow.
+        #[inline]
+        pub fn is_overflow(self) -> bool { self.0.is_overflow() }
+
+        /// Returns `true` if this operation error'ed due to division by zero.
+        #[inline]
+        pub fn is_div_by_zero(self) -> bool { self.0.is_div_by_zero() }
+
+        /// Returns the [`MathOp`] that caused this error.
+        #[inline]
+        pub fn operation(self) -> MathOp { self.0 }
+    }
+
+    impl From<Infallible> for NumOpError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for NumOpError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "math operation '{}' gave an invalid numeric result", self.operation())
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for NumOpError {
+        #[inline]
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
     }
 }
 
@@ -439,7 +471,12 @@ impl<'a> Arbitrary<'a> for MathOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{MathOp, NumOpError, NumOpResult};
+    #[cfg(feature = "alloc")]
+    use alloc::string::ToString;
+    #[cfg(feature = "std")]
+    use std::error::Error;
+
+    use crate::result::{MathOp, NumOpError, NumOpResult};
     use crate::{Amount, FeeRate, Weight};
 
     #[test]
@@ -604,5 +641,15 @@ mod tests {
             panic!("and_then should not evaluate for wrapped error values");
         });
         assert_eq!(res_err, res);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn error_display_is_non_empty() {
+        // NumOpError - math operation error
+        let e = (Amount::MAX + Amount::MAX).unwrap_err();
+        assert!(!e.to_string().is_empty());
+        #[cfg(feature = "std")]
+        assert!(e.source().is_none());
     }
 }

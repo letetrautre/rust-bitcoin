@@ -19,6 +19,8 @@ use crate::Wtxid;
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WitnessMerkleNode(sha256d::Hash);
 
+super::impl_debug!(WitnessMerkleNode);
+
 // The new hash wrapper type.
 type HashType = WitnessMerkleNode;
 // The inner hash type from `hashes`.
@@ -48,54 +50,40 @@ impl WitnessMerkleNode {
     }
 }
 
-encoding::encoder_newtype_exact! {
-    /// The encoder for the [`WitnessMerkleNode`] type.
-    pub struct WitnessMerkleNodeEncoder<'e>(encoding::ArrayEncoder<32>);
-}
-
-impl encoding::Encodable for WitnessMerkleNode {
+impl encoding::Encode for WitnessMerkleNode {
     type Encoder<'e> = WitnessMerkleNodeEncoder<'e>;
+    #[inline]
     fn encoder(&self) -> Self::Encoder<'_> {
-        WitnessMerkleNodeEncoder::new(encoding::ArrayEncoder::without_length_prefix(
-            self.to_byte_array(),
+        WitnessMerkleNodeEncoder::new(encoding::ArrayRefEncoder::without_length_prefix(
+            self.as_byte_array(),
         ))
     }
 }
 
-/// The decoder for the [`WitnessMerkleNode`] type.
-pub struct WitnessMerkleNodeDecoder(encoding::ArrayDecoder<32>);
-
-impl WitnessMerkleNodeDecoder {
-    /// Constructs a new [`WitnessMerkleNode`] decoder.
-    pub fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
-}
-
-impl Default for WitnessMerkleNodeDecoder {
-    fn default() -> Self { Self::new() }
-}
-
-impl encoding::Decoder for WitnessMerkleNodeDecoder {
-    type Output = WitnessMerkleNode;
-    type Error = WitnessMerkleNodeDecoderError;
-
-    #[inline]
-    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        self.0.push_bytes(bytes).map_err(WitnessMerkleNodeDecoderError)
-    }
-
-    #[inline]
-    fn end(self) -> Result<Self::Output, Self::Error> {
-        let a = self.0.end().map_err(WitnessMerkleNodeDecoderError)?;
-        Ok(WitnessMerkleNode::from_byte_array(a))
-    }
-
-    #[inline]
-    fn read_limit(&self) -> usize { self.0.read_limit() }
-}
-
-impl encoding::Decodable for WitnessMerkleNode {
+impl encoding::Decode for WitnessMerkleNode {
     type Decoder = WitnessMerkleNodeDecoder;
+    #[inline]
     fn decoder() -> Self::Decoder { WitnessMerkleNodeDecoder(encoding::ArrayDecoder::<32>::new()) }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`WitnessMerkleNode`] type.
+    #[derive(Debug, Clone)]
+    pub struct WitnessMerkleNodeEncoder<'e>(encoding::ArrayRefEncoder<'e, 32>);
+}
+
+crate::decoder_newtype! {
+    /// The decoder for the [`WitnessMerkleNode`] type.
+    #[derive(Debug, Clone)]
+    pub struct WitnessMerkleNodeDecoder(encoding::ArrayDecoder<32>);
+
+    /// Constructs a new [`WitnessMerkleNode`] decoder.
+    pub const fn new() -> Self { Self(encoding::ArrayDecoder::new()) }
+
+    fn end(result: Result<[u8; 32], encoding::UnexpectedEofError>) -> Result<WitnessMerkleNode, WitnessMerkleNodeDecoderError> {
+        let bytes = result.map_err(WitnessMerkleNodeDecoderError)?;
+        Ok(WitnessMerkleNode::from_byte_array(bytes))
+    }
 }
 
 /// An error consensus decoding an `WitnessMerkleNode`.
@@ -108,7 +96,7 @@ impl From<Infallible> for WitnessMerkleNodeDecoderError {
 
 impl fmt::Display for WitnessMerkleNodeDecoderError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write_err!(f, "sequence decoder error"; self.0)
+        write_err!(f, "witness merkle node decoder error"; self.0)
     }
 }
 
@@ -136,7 +124,7 @@ mod tests {
         assert_eq!(WitnessMerkleNodeDecoder::new().read_limit(), 32);
         // These two are the same decoder but we want 100% coverage.
         assert_eq!(WitnessMerkleNodeDecoder::default().read_limit(), 32);
-        assert_eq!(<WitnessMerkleNode as encoding::Decodable>::decoder().read_limit(), 32);
+        assert_eq!(<WitnessMerkleNode as encoding::Decode>::decoder().read_limit(), 32);
     }
 
     #[test]

@@ -284,7 +284,9 @@ impl ChainHash {
 
 #[cfg(test)]
 mod test {
-    use hex_lit::hex;
+    use alloc::string::ToString;
+
+    use hex_unstable::hex;
 
     use super::*;
     use crate::consensus::encode::serialize;

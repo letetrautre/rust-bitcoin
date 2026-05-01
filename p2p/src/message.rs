@@ -2,7 +2,7 @@
 
 //! Bitcoin network messages.
 //!
-//! This module defines the `NetworkMessage` and `RawNetworkMessage` types that
+//! This module defines the `NetworkMessage` and `V1NetworkMessage` types that
 //! are used for (de)serializing Bitcoin objects for transmission on the network.
 
 use alloc::borrow::{Cow, ToOwned};
@@ -10,26 +10,38 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::convert::Infallible;
-use core::{cmp, fmt};
+use core::{cmp, fmt, mem};
 
 #[cfg(feature = "arbitrary")]
 use arbitrary::{Arbitrary, Unstructured};
 use bitcoin::consensus::encode::{self, Decodable, Encodable, ReadExt, WriteExt};
-use encoding::{self, CompactSizeEncoder, Encoder2, SliceEncoder, VecDecoder};
-use hashes::sha256d;
+use encoding::{
+    self, ArrayDecoder, ArrayEncoder, BytesEncoder, CompactSizeEncoder, Decoder2, Encoder2,
+    SliceEncoder, VecDecoder,
+};
+use hashes::{sha256d, HashEngine};
 use internals::ToU64 as _;
-use internals::write_err;
 use io::{self, BufRead, Read, Write};
-use primitives::{block, transaction};
+use primitives::block::{self, HeaderDecoder, HeaderEncoder};
+use primitives::transaction;
 use units::FeeRate;
 
-use crate::address::{AddrV2Message, Address};
+use self::error::V1NetworkMessageDecoderErrorInner;
+use crate::address::{AddrV1Message, AddrV2Message};
 use crate::consensus::{impl_consensus_encoding, impl_vec_wrapper};
 use crate::merkle_tree::MerkleBlock;
 use crate::{
     bip152, message_blockdata, message_bloom, message_compact_blocks, message_filter,
     message_network, Magic,
+};
+
+#[rustfmt::skip]                // Keep public re-exports separate.
+#[doc(no_inline)]
+pub use self::error::{
+    AddrPayloadDecoderError, AddrV2PayloadDecoderError, CommandStringDecoderError,
+    CommandStringError, HeadersMessageDecoderError, InventoryPayloadDecoderError,
+    NetworkHeaderDecoderError, PingDecoderError, PongDecoderError,
+    V1MessageHeaderDecoderError, V1NetworkMessageDecoderError, V2NetworkMessageDecoderError
 };
 
 /// The maximum number of [`super::message_blockdata::Inventory`] items in an `inv` message.
@@ -135,25 +147,52 @@ impl Decodable for CommandString {
     }
 }
 
-impl encoding::Encodable for CommandString {
-    type Encoder<'e> = encoding::ArrayEncoder<12>;
+impl encoding::Encode for CommandString {
+    type Encoder<'e> = CommandStringEncoder;
 
     fn encoder(&self) -> Self::Encoder<'_> {
         let mut rawbytes = [0u8; 12];
         let strbytes = self.0.as_bytes();
         debug_assert!(strbytes.len() <= 12);
         rawbytes[..strbytes.len()].copy_from_slice(strbytes);
-        encoding::ArrayEncoder::without_length_prefix(rawbytes)
+        CommandStringEncoder::without_length_prefix(rawbytes)
     }
 }
 
-impl encoding::Decodable for CommandString {
+impl encoding::Decode for CommandString {
     type Decoder = CommandStringDecoder;
 
     fn decoder() -> Self::Decoder { CommandStringDecoder { inner: encoding::ArrayDecoder::new() } }
 }
 
+/// Encoder for the [`CommandString`] type
+// We can't use the [`encoder_newtype!`] macro due to the lifetime conflicting
+// when constructing the encoder in `V1NetworkMessage`.
+#[derive(Debug, Clone)]
+pub struct CommandStringEncoder(encoding::ArrayEncoder<12>);
+
+impl CommandStringEncoder {
+    /// Constructs an encoder which encodes the command string with no length prefix.
+    pub const fn without_length_prefix(arr: [u8; 12]) -> Self {
+        Self(encoding::ArrayEncoder::without_length_prefix(arr))
+    }
+}
+
+impl encoding::Encoder for CommandStringEncoder {
+    #[inline]
+    fn current_chunk(&self) -> &[u8] { self.0.current_chunk() }
+
+    #[inline]
+    fn advance(&mut self) -> bool { self.0.advance() }
+}
+
+impl encoding::ExactSizeEncoder for CommandStringEncoder {
+    #[inline]
+    fn len(&self) -> usize { self.0.len() }
+}
+
 /// Decoder for [`CommandString`].
+#[derive(Debug, Clone)]
 pub struct CommandStringDecoder {
     inner: encoding::ArrayDecoder<12>,
 }
@@ -182,62 +221,9 @@ impl encoding::Decoder for CommandStringDecoder {
     fn read_limit(&self) -> usize { self.inner.read_limit() }
 }
 
-/// Error decoding a [`CommandString`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CommandStringDecoderError {
-    /// Unexpected end of data.
-    UnexpectedEof(encoding::UnexpectedEofError),
-    /// Command string contains non-ASCII characters.
-    NotAscii,
-}
-
-impl fmt::Display for CommandStringDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::UnexpectedEof(e) => write!(f, "unexpected end of data: {}", e),
-            Self::NotAscii => write!(f, "command string must be ASCII"),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl std::error::Error for CommandStringDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::UnexpectedEof(e) => Some(e),
-            Self::NotAscii => None,
-        }
-    }
-}
-
-/// Error returned when a command string is invalid.
-///
-/// This is currently returned for command strings longer than 12.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct CommandStringError {
-    cow: Cow<'static, str>,
-}
-
-impl fmt::Display for CommandStringError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "the command string '{}' has length {} which is larger than 12",
-            self.cow,
-            self.cow.len()
-        )
-    }
-}
-
-impl std::error::Error for CommandStringError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
-}
-
 /// A Network message using the v1 p2p protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RawNetworkMessage {
+pub struct V1NetworkMessage {
     magic: Magic,
     payload: NetworkMessage,
     payload_len: u32,
@@ -257,6 +243,37 @@ pub struct V1MessageHeader {
     pub checksum: [u8; 4],
 }
 
+impl encoding::Encode for V1MessageHeader {
+    type Encoder<'e>
+        = V1MessageHeaderEncoder<'e>
+    where
+        Self: 'e;
+
+    #[inline]
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let enc = encoding::Encoder4::new(
+            self.magic.encoder(),
+            self.command.encoder(),
+            encoding::ArrayEncoder::without_length_prefix(self.length.to_le_bytes()),
+            encoding::ArrayEncoder::without_length_prefix(self.checksum),
+        );
+
+        V1MessageHeaderEncoder::new(enc)
+    }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`V1MessageHeader`] type.
+    #[derive(Debug, Clone)]
+    pub struct V1MessageHeaderEncoder<'e>(
+        encoding::Encoder4<
+            crate::MagicEncoder<'e>,
+            CommandStringEncoder,
+            encoding::ArrayEncoder<4>,
+            encoding::ArrayEncoder<4>
+    >);
+}
+
 type V1MessageHeaderInnerDecoder = encoding::Decoder4<
     encoding::ArrayDecoder<4>,
     CommandStringDecoder,
@@ -265,6 +282,7 @@ type V1MessageHeaderInnerDecoder = encoding::Decoder4<
 >;
 
 /// The Decoder for `V1MessageHeader`
+#[derive(Debug, Clone)]
 pub struct V1MessageHeaderDecoder(V1MessageHeaderInnerDecoder);
 
 impl encoding::Decoder for V1MessageHeaderDecoder {
@@ -292,7 +310,7 @@ impl encoding::Decoder for V1MessageHeaderDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for V1MessageHeader {
+impl encoding::Decode for V1MessageHeader {
     type Decoder = V1MessageHeaderDecoder;
     fn decoder() -> Self::Decoder {
         V1MessageHeaderDecoder(encoding::Decoder4::new(
@@ -301,16 +319,6 @@ impl encoding::Decodable for V1MessageHeader {
             encoding::ArrayDecoder::<4>::new(),
             encoding::ArrayDecoder::<4>::new(),
         ))
-    }
-}
-
-/// An error consensus decoding a [`V1MessageHeaderDecoderError`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct V1MessageHeaderDecoderError(<V1MessageHeaderInnerDecoder as encoding::Decoder>::Error);
-
-impl fmt::Display for V1MessageHeaderDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        internals::write_err!(f, "message header decoder error"; self.0)
     }
 }
 
@@ -328,10 +336,11 @@ pub struct InventoryPayload(pub Vec<message_blockdata::Inventory>);
 
 encoding::encoder_newtype! {
     /// The encoder for an [`InventoryPayload`].
+    #[derive(Debug, Clone)]
     pub struct InventoryPayloadEncoder<'e>(Encoder2<CompactSizeEncoder, SliceEncoder<'e, message_blockdata::Inventory>>);
 }
 
-impl encoding::Encodable for InventoryPayload {
+impl encoding::Encode for InventoryPayload {
     type Encoder<'e>
         = Encoder2<CompactSizeEncoder, SliceEncoder<'e, message_blockdata::Inventory>>
     where
@@ -340,7 +349,7 @@ impl encoding::Encodable for InventoryPayload {
     fn encoder(&self) -> Self::Encoder<'_> {
         Encoder2::new(
             CompactSizeEncoder::new(self.0.len()),
-            SliceEncoder::without_length_prefix(&self.0)
+            SliceEncoder::without_length_prefix(&self.0),
         )
     }
 }
@@ -348,6 +357,7 @@ impl encoding::Encodable for InventoryPayload {
 type InventoryInnerDecoder = VecDecoder<message_blockdata::Inventory>;
 
 /// Decoder type for [`InventoryPayload`].
+#[derive(Debug, Clone)]
 pub struct InventoryPayloadDecoder(InventoryInnerDecoder);
 
 impl encoding::Decoder for InventoryPayloadDecoder {
@@ -361,49 +371,125 @@ impl encoding::Decoder for InventoryPayloadDecoder {
 
     #[inline]
     fn end(self) -> Result<Self::Output, Self::Error> {
-       Ok(InventoryPayload(self.0.end().map_err(InventoryPayloadDecoderError)?))
+        Ok(InventoryPayload(self.0.end().map_err(InventoryPayloadDecoderError)?))
     }
 
     #[inline]
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for InventoryPayload {
+impl encoding::Decode for InventoryPayload {
     type Decoder = InventoryPayloadDecoder;
     fn decoder() -> Self::Decoder {
         InventoryPayloadDecoder(VecDecoder::<message_blockdata::Inventory>::new())
     }
 }
 
-/// An error decoding a [`InventoryPayload`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InventoryPayloadDecoderError(<InventoryInnerDecoder as encoding::Decoder>::Error);
+/// A list of legacy p2p address messages.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AddrPayload(pub Vec<AddrV1Message>);
 
-impl From<Infallible> for InventoryPayloadDecoderError {
-    fn from(never: Infallible) -> Self { match never {} }
+encoding::encoder_newtype! {
+    /// The encoder for an [`AddrPayload`].
+    #[derive(Debug, Clone)]
+    pub struct AddrPayloadEncoder<'e>(Encoder2<CompactSizeEncoder, SliceEncoder<'e, AddrV1Message>>);
 }
 
-impl fmt::Display for InventoryPayloadDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_err!(f, "inventory payload error"; self.0)
+impl encoding::Encode for AddrPayload {
+    type Encoder<'e> = AddrPayloadEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        AddrPayloadEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.0.len()),
+            SliceEncoder::without_length_prefix(&self.0),
+        ))
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for InventoryPayloadDecoderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+type AddrPayloadInnerDecoder = VecDecoder<AddrV1Message>;
+
+/// Decoder type for [`AddrPayload`].
+#[derive(Debug, Clone)]
+pub struct AddrPayloadDecoder(AddrPayloadInnerDecoder);
+
+impl encoding::Decoder for AddrPayloadDecoder {
+    type Output = AddrPayload;
+    type Error = AddrPayloadDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(AddrPayloadDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        Ok(AddrPayload(self.0.end().map_err(AddrPayloadDecoderError)?))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-/// A list of legacy p2p address messages.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct AddrPayload(pub Vec<(u32, Address)>);
+impl encoding::Decode for AddrPayload {
+    type Decoder = AddrPayloadDecoder;
+    fn decoder() -> Self::Decoder { AddrPayloadDecoder(VecDecoder::new()) }
+}
 
 /// A list of v2 address messages.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AddrV2Payload(pub Vec<AddrV2Message>);
 
+encoding::encoder_newtype! {
+    /// The encoder for an [`AddrV2Payload`].
+    #[derive(Debug, Clone)]
+    pub struct AddrV2PayloadEncoder<'e>(Encoder2<CompactSizeEncoder, SliceEncoder<'e, AddrV2Message>>);
+}
+
+impl encoding::Encode for AddrV2Payload {
+    type Encoder<'e>
+        = Encoder2<CompactSizeEncoder, SliceEncoder<'e, AddrV2Message>>
+    where
+        Self: 'e;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        Encoder2::new(
+            CompactSizeEncoder::new(self.0.len()),
+            SliceEncoder::without_length_prefix(&self.0),
+        )
+    }
+}
+
+type AddrV2PayloadInnerDecoder = VecDecoder<AddrV2Message>;
+
+/// Decoder type for [`AddrV2Payload`].
+#[derive(Debug, Clone)]
+pub struct AddrV2PayloadDecoder(AddrV2PayloadInnerDecoder);
+
+impl encoding::Decoder for AddrV2PayloadDecoder {
+    type Output = AddrV2Payload;
+    type Error = AddrV2PayloadDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(AddrV2PayloadDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        Ok(AddrV2Payload(self.0.end().map_err(AddrV2PayloadDecoderError)?))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for AddrV2Payload {
+    type Decoder = AddrV2PayloadDecoder;
+    fn decoder() -> Self::Decoder { AddrV2PayloadDecoder(VecDecoder::new()) }
+}
+
 impl_vec_wrapper!(InventoryPayload, message_blockdata::Inventory);
-impl_vec_wrapper!(AddrPayload, (u32, Address));
+impl_vec_wrapper!(AddrPayload, AddrV1Message);
 impl_vec_wrapper!(AddrV2Payload, AddrV2Message);
 
 /// The `feefilter` message, wrapper around [`FeeRate`] for P2P wire format encoding.
@@ -434,7 +520,7 @@ impl From<FeeFilter> for FeeRate {
 impl bitcoin::consensus::encode::Encodable for FeeFilter {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         use encoding::Encoder;
-        let mut encoder = encoding::Encodable::encoder(self);
+        let mut encoder = encoding::Encode::encoder(self);
         loop {
             w.write_all(encoder.current_chunk())?;
             if !encoder.advance() {
@@ -451,7 +537,7 @@ impl bitcoin::consensus::encode::Decodable for FeeFilter {
     ) -> Result<Self, bitcoin::consensus::encode::Error> {
         use encoding::Decoder;
 
-        let mut decoder = <Self as encoding::Decodable>::decoder();
+        let mut decoder = <Self as encoding::Decode>::decoder();
         let mut buffer = [0u8; 8];
 
         r.read_exact(&mut buffer)?;
@@ -475,10 +561,11 @@ impl bitcoin::consensus::encode::Decodable for FeeFilter {
 
 encoding::encoder_newtype_exact! {
     /// Encoder for [`FeeFilter`] type.
+    #[derive(Debug, Clone)]
     pub struct FeeFilterEncoder<'e>(encoding::ArrayEncoder<8>);
 }
 
-impl encoding::Encodable for FeeFilter {
+impl encoding::Encode for FeeFilter {
     type Encoder<'e> = FeeFilterEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
@@ -489,6 +576,7 @@ impl encoding::Encodable for FeeFilter {
 }
 
 /// Decoder for [`FeeFilter`] type.
+#[derive(Debug, Clone)]
 pub struct FeeFilterDecoder(encoding::ArrayDecoder<8>);
 
 impl FeeFilterDecoder {
@@ -522,7 +610,7 @@ impl encoding::Decoder for FeeFilterDecoder {
     fn read_limit(&self) -> usize { self.0.read_limit() }
 }
 
-impl encoding::Decodable for FeeFilter {
+impl encoding::Decode for FeeFilter {
     type Decoder = FeeFilterDecoder;
 
     fn decoder() -> Self::Decoder { FeeFilterDecoder::new() }
@@ -539,6 +627,117 @@ impl<'a> Arbitrary<'a> for FeeFilter {
             _ => Ok(Self(FeeRate::from_sat_per_kvb(u.int_in_range(0..=u32::MAX)?))),
         }
     }
+}
+
+/// Serializer for Ping
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Ping(u64);
+
+impl Ping {
+    /// Constructs a new [`Ping`] message from nonce.
+    pub fn new(nonce: u64) -> Self { Self(nonce) }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Ping`] type.
+    #[derive(Debug, Clone)]
+    pub struct PingEncoder<'e>(encoding::ArrayEncoder<8>);
+}
+
+impl encoding::Encode for Ping {
+    type Encoder<'e>
+        = PingEncoder<'e>
+    where
+        Self: 'e;
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let nonce = encoding::ArrayEncoder::without_length_prefix(self.0.to_le_bytes());
+        PingEncoder::new(nonce)
+    }
+}
+
+/// The Decoder for [`Ping`]
+#[derive(Debug, Clone)]
+pub struct PingDecoder(encoding::ArrayDecoder<8>);
+
+impl encoding::Decoder for PingDecoder {
+    type Output = Ping;
+    type Error = PingDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(PingDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let nonce = self.0.end().map_err(PingDecoderError)?;
+        Ok(Ping(u64::from_le_bytes(nonce)))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for Ping {
+    type Decoder = PingDecoder;
+    fn decoder() -> Self::Decoder { PingDecoder(encoding::ArrayDecoder::<8>::new()) }
+}
+
+/// Serializer for Pong
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Pong(u64);
+
+impl Pong {
+    /// Construct a response [`Pong`] given a received [`Ping`].
+    pub fn from_ping(ping: &Ping) -> Self {
+        let nonce = ping.0;
+        Self(nonce)
+    }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder for the [`Pong`] type.
+    #[derive(Debug, Clone)]
+    pub struct PongEncoder<'e>(encoding::ArrayEncoder<8>);
+}
+
+impl encoding::Encode for Pong {
+    type Encoder<'e>
+        = PongEncoder<'e>
+    where
+        Self: 'e;
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let nonce = encoding::ArrayEncoder::without_length_prefix(self.0.to_le_bytes());
+        PongEncoder::new(nonce)
+    }
+}
+
+/// The Decoder for [`Pong`]
+#[derive(Debug, Clone)]
+pub struct PongDecoder(encoding::ArrayDecoder<8>);
+
+impl encoding::Decoder for PongDecoder {
+    type Output = Pong;
+    type Error = PongDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(PongDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let nonce = self.0.end().map_err(PongDecoderError)?;
+        Ok(Pong(u64::from_le_bytes(nonce)))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for Pong {
+    type Decoder = PongDecoder;
+    fn decoder() -> Self::Decoder { PongDecoder(encoding::ArrayDecoder::<8>::new()) }
 }
 
 /// A Network message payload. Proper documentation is available at
@@ -574,9 +773,9 @@ pub enum NetworkMessage {
     /// `getaddr`
     GetAddr,
     /// `ping`
-    Ping(u64),
+    Ping(Ping),
     /// `pong`
-    Pong(u64),
+    Pong(Pong),
     /// `merkleblock`
     MerkleBlock(MerkleBlock),
     /// BIP-0037 `filterload`
@@ -688,23 +887,19 @@ impl NetworkMessage {
     }
 }
 
-impl RawNetworkMessage {
-    /// Constructs a new [`RawNetworkMessage`]
+impl V1NetworkMessage {
+    /// Constructs a new [`V1NetworkMessage`]
     ///
     /// # Panics
     ///
-    /// Panics if message encoding fails or if the payload length exceeds `u32::MAX`.
+    /// Panics if the payload length exceeds `u32::MAX`.
     pub fn new(magic: Magic, payload: NetworkMessage) -> Self {
-        let mut engine = sha256d::Hash::engine();
-        let payload_len = payload.consensus_encode(&mut engine).expect("engine doesn't error");
-        let payload_len = u32::try_from(payload_len).expect("network message use u32 as length");
-        let checksum = sha256d::Hash::from_engine(engine);
-        let checksum = checksum.to_byte_array();
-        let checksum = [checksum[0], checksum[1], checksum[2], checksum[3]];
+        let (bytes_hashed, checksum) = sha2_checksum(&payload);
+        let payload_len = u32::try_from(bytes_hashed).expect("network message use u32 as length");
         Self { magic, payload, payload_len, checksum }
     }
 
-    /// Consumes the [`RawNetworkMessage`] instance and returns the inner payload.
+    /// Consumes the [`V1NetworkMessage`] instance and returns the inner payload.
     pub fn into_payload(self) -> NetworkMessage { self.payload }
 
     /// The actual message data
@@ -745,19 +940,6 @@ impl V2NetworkMessage {
     pub fn command(&self) -> CommandString { self.payload.command() }
 }
 
-impl Encodable for HeadersMessage {
-    #[inline]
-    fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
-        let mut len = 0;
-        len += w.emit_compact_size(self.0.len())?;
-        for header in &self.0 {
-            len += header.consensus_encode(w)?;
-            len += 0u8.consensus_encode(w)?;
-        }
-        Ok(len)
-    }
-}
-
 impl Encodable for NetworkMessage {
     fn consensus_encode<W: Write + ?Sized>(&self, writer: &mut W) -> Result<usize, io::Error> {
         match self {
@@ -771,8 +953,8 @@ impl Encodable for NetworkMessage {
             Self::Tx(ref dat) => dat.consensus_encode(writer),
             Self::Block(ref dat) => dat.consensus_encode(writer),
             Self::Headers(ref dat) => dat.consensus_encode(writer),
-            Self::Ping(ref dat) => dat.consensus_encode(writer),
-            Self::Pong(ref dat) => dat.consensus_encode(writer),
+            Self::Ping(ref dat) => dat.0.consensus_encode(writer),
+            Self::Pong(ref dat) => dat.0.consensus_encode(writer),
             Self::MerkleBlock(ref dat) => dat.consensus_encode(writer),
             Self::FilterLoad(ref dat) => dat.consensus_encode(writer),
             Self::FilterAdd(ref dat) => dat.consensus_encode(writer),
@@ -797,12 +979,20 @@ impl Encodable for NetworkMessage {
             | Self::WtxidRelay
             | Self::FilterClear
             | Self::SendAddrV2 => Ok(0),
-            Self::Unknown { payload: ref data, .. } => data.consensus_encode(writer),
+            // Don't use consensus_encode so as not to add a length suffix.
+            Self::Unknown { payload: ref data, .. } => writer.write(data),
         }
     }
 }
 
-impl Encodable for RawNetworkMessage {
+impl encoding::Encode for NetworkMessage {
+    type Encoder<'e> = NetworkMessageEncoder<'e>;
+
+    #[inline]
+    fn encoder(&self) -> Self::Encoder<'_> { NetworkMessageEncoder::new(self) }
+}
+
+impl Encodable for V1NetworkMessage {
     fn consensus_encode<W: Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
         let mut len = 0;
         len += self.magic.consensus_encode(w)?;
@@ -814,56 +1004,212 @@ impl Encodable for RawNetworkMessage {
     }
 }
 
-struct NetworkMessageEncoder {
-    buffer: Vec<u8>,
-    exhausted: bool,
+/// Encoder for [`NetworkMessage`]
+#[derive(Debug, Clone)]
+pub enum NetworkMessageEncoder<'e> {
+    /// Encodes [`NetworkMessage::Version`]
+    Version(<message_network::VersionMessage as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Addr`]
+    Addr(<AddrPayload as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Inv`]
+    Inv(<InventoryPayload as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetData`]
+    GetData(<InventoryPayload as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::NotFound`]
+    NotFound(<InventoryPayload as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetBlocks`]
+    GetBlocks(<message_blockdata::GetBlocksMessage as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetHeaders`]
+    GetHeaders(<message_blockdata::GetHeadersMessage as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Tx`]
+    Tx(<transaction::Transaction as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Block`]
+    Block(<block::Block as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Headers`]
+    Headers(<HeadersMessage as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Ping`]
+    Ping(<Ping as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Pong`]
+    Pong(<Pong as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::MerkleBlock`]
+    MerkleBlock(<MerkleBlock as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::FilterLoad`]
+    FilterLoad(<message_bloom::FilterLoad as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::FilterAdd`]
+    FilterAdd(<message_bloom::FilterAdd as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetCFilters`]
+    GetCFilters(<message_filter::GetCFilters as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::CFilter`]
+    CFilter(<message_filter::CFilter as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetCFHeaders`]
+    GetCFHeaders(<message_filter::GetCFHeaders as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::CFHeaders`]
+    CFHeaders(<message_filter::CFHeaders as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetCFCheckpt`]
+    GetCFCheckpt(<message_filter::GetCFCheckpt as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::CFCheckpt`]
+    CFCheckpt(<message_filter::CFCheckpt as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::SendCmpct`]
+    SendCmpct(<message_compact_blocks::SendCmpct as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::CmpctBlock`]
+    CmpctBlock(<bip152::HeaderAndShortIds as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::GetBlockTxn`]
+    GetBlockTxn(<bip152::BlockTransactionsRequest as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::BlockTxn`]
+    BlockTxn(<bip152::BlockTransactions as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Alert`]
+    Alert(<message_network::Alert as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::Reject`]
+    Reject(<message_network::Reject as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::FeeFilter`]
+    FeeFilter(<FeeFilter as encoding::Encode>::Encoder<'e>),
+    /// Encodes [`NetworkMessage::AddrV2`]
+    AddrV2(<AddrV2Payload as encoding::Encode>::Encoder<'e>),
+    /// Encodes zero-payload messages: verack, mempool, sendheaders, getaddr, wtxidrelay,
+    /// filterclear, sendaddrv2.
+    Empty,
+    /// Encodes [`NetworkMessage::Unknown`]; borrows the raw payload bytes directly.
+    Unknown(BytesEncoder<'e>),
 }
 
-impl NetworkMessageEncoder {
-    fn new(msg: &NetworkMessage) -> Self {
-        let mut buffer = Vec::new();
-        // TODO: delegate to internal encoders once migrated to consensus_encoding.
-        bitcoin::consensus::encode::Encodable::consensus_encode(msg, &mut buffer)
-            .expect("encoding to vec cannot fail");
-        Self { buffer, exhausted: false }
+impl<'e> NetworkMessageEncoder<'e> {
+    fn new(msg: &'e NetworkMessage) -> Self {
+        use encoding::Encode as _;
+        match msg {
+            NetworkMessage::Version(dat) => Self::Version(dat.encoder()),
+            NetworkMessage::Addr(dat) => Self::Addr(dat.encoder()),
+            NetworkMessage::Inv(dat) => Self::Inv(dat.encoder()),
+            NetworkMessage::GetData(dat) => Self::GetData(dat.encoder()),
+            NetworkMessage::NotFound(dat) => Self::NotFound(dat.encoder()),
+            NetworkMessage::GetBlocks(dat) => Self::GetBlocks(dat.encoder()),
+            NetworkMessage::GetHeaders(dat) => Self::GetHeaders(dat.encoder()),
+            NetworkMessage::Tx(dat) => Self::Tx(dat.encoder()),
+            NetworkMessage::Block(dat) => Self::Block(dat.encoder()),
+            NetworkMessage::Headers(dat) => Self::Headers(dat.encoder()),
+            NetworkMessage::Ping(dat) => Self::Ping(dat.encoder()),
+            NetworkMessage::Pong(dat) => Self::Pong(dat.encoder()),
+            NetworkMessage::MerkleBlock(dat) => Self::MerkleBlock(dat.encoder()),
+            NetworkMessage::FilterLoad(dat) => Self::FilterLoad(dat.encoder()),
+            NetworkMessage::FilterAdd(dat) => Self::FilterAdd(dat.encoder()),
+            NetworkMessage::GetCFilters(dat) => Self::GetCFilters(dat.encoder()),
+            NetworkMessage::CFilter(dat) => Self::CFilter(dat.encoder()),
+            NetworkMessage::GetCFHeaders(dat) => Self::GetCFHeaders(dat.encoder()),
+            NetworkMessage::CFHeaders(dat) => Self::CFHeaders(dat.encoder()),
+            NetworkMessage::GetCFCheckpt(dat) => Self::GetCFCheckpt(dat.encoder()),
+            NetworkMessage::CFCheckpt(dat) => Self::CFCheckpt(dat.encoder()),
+            NetworkMessage::SendCmpct(dat) => Self::SendCmpct(dat.encoder()),
+            NetworkMessage::CmpctBlock(dat) => Self::CmpctBlock(dat.encoder()),
+            NetworkMessage::GetBlockTxn(dat) => Self::GetBlockTxn(dat.encoder()),
+            NetworkMessage::BlockTxn(dat) => Self::BlockTxn(dat.encoder()),
+            NetworkMessage::Alert(dat) => Self::Alert(dat.encoder()),
+            NetworkMessage::Reject(dat) => Self::Reject(dat.encoder()),
+            NetworkMessage::FeeFilter(dat) => Self::FeeFilter(dat.encoder()),
+            NetworkMessage::AddrV2(dat) => Self::AddrV2(dat.encoder()),
+            NetworkMessage::Verack
+            | NetworkMessage::SendHeaders
+            | NetworkMessage::MemPool
+            | NetworkMessage::GetAddr
+            | NetworkMessage::WtxidRelay
+            | NetworkMessage::FilterClear
+            | NetworkMessage::SendAddrV2 => Self::Empty,
+            // Don't use encode_to_vec so as not to add a length prefix.
+            NetworkMessage::Unknown { payload, .. } =>
+                Self::Unknown(BytesEncoder::without_length_prefix(payload)),
+        }
     }
 }
 
-impl encoding::Encoder for NetworkMessageEncoder {
+impl encoding::Encoder for NetworkMessageEncoder<'_> {
     fn current_chunk(&self) -> &[u8] {
-        if self.exhausted {
-            &[]
-        } else {
-            &self.buffer
+        match self {
+            Self::Version(e) => e.current_chunk(),
+            Self::Addr(e) => e.current_chunk(),
+            Self::Inv(e) | Self::GetData(e) | Self::NotFound(e) => e.current_chunk(),
+            Self::GetBlocks(e) => e.current_chunk(),
+            Self::GetHeaders(e) => e.current_chunk(),
+            Self::Tx(e) => e.current_chunk(),
+            Self::Block(e) => e.current_chunk(),
+            Self::Headers(e) => e.current_chunk(),
+            Self::Ping(e) => e.current_chunk(),
+            Self::Pong(e) => e.current_chunk(),
+            Self::MerkleBlock(e) => e.current_chunk(),
+            Self::FilterLoad(e) => e.current_chunk(),
+            Self::FilterAdd(e) => e.current_chunk(),
+            Self::GetCFilters(e) => e.current_chunk(),
+            Self::CFilter(e) => e.current_chunk(),
+            Self::GetCFHeaders(e) => e.current_chunk(),
+            Self::CFHeaders(e) => e.current_chunk(),
+            Self::GetCFCheckpt(e) => e.current_chunk(),
+            Self::CFCheckpt(e) => e.current_chunk(),
+            Self::SendCmpct(e) => e.current_chunk(),
+            Self::CmpctBlock(e) => e.current_chunk(),
+            Self::GetBlockTxn(e) => e.current_chunk(),
+            Self::BlockTxn(e) => e.current_chunk(),
+            Self::Alert(e) => e.current_chunk(),
+            Self::Reject(e) => e.current_chunk(),
+            Self::FeeFilter(e) => e.current_chunk(),
+            Self::AddrV2(e) => e.current_chunk(),
+            Self::Empty => &[],
+            Self::Unknown(e) => e.current_chunk(),
         }
     }
 
     fn advance(&mut self) -> bool {
-        self.exhausted = true;
-        false
+        match self {
+            Self::Version(e) => e.advance(),
+            Self::Addr(e) => e.advance(),
+            Self::Inv(e) | Self::GetData(e) | Self::NotFound(e) => e.advance(),
+            Self::GetBlocks(e) => e.advance(),
+            Self::GetHeaders(e) => e.advance(),
+            Self::Tx(e) => e.advance(),
+            Self::Block(e) => e.advance(),
+            Self::Headers(e) => e.advance(),
+            Self::Ping(e) => e.advance(),
+            Self::Pong(e) => e.advance(),
+            Self::MerkleBlock(e) => e.advance(),
+            Self::FilterLoad(e) => e.advance(),
+            Self::FilterAdd(e) => e.advance(),
+            Self::GetCFilters(e) => e.advance(),
+            Self::CFilter(e) => e.advance(),
+            Self::GetCFHeaders(e) => e.advance(),
+            Self::CFHeaders(e) => e.advance(),
+            Self::GetCFCheckpt(e) => e.advance(),
+            Self::CFCheckpt(e) => e.advance(),
+            Self::SendCmpct(e) => e.advance(),
+            Self::CmpctBlock(e) => e.advance(),
+            Self::GetBlockTxn(e) => e.advance(),
+            Self::BlockTxn(e) => e.advance(),
+            Self::Alert(e) => e.advance(),
+            Self::Reject(e) => e.advance(),
+            Self::FeeFilter(e) => e.advance(),
+            Self::AddrV2(e) => e.advance(),
+            Self::Empty => false,
+            Self::Unknown(e) => e.advance(),
+        }
     }
 }
 
 encoding::encoder_newtype! {
-    /// Encoder for [`RawNetworkMessage`].
-    pub struct RawNetworkMessageEncoder<'e>(
+    /// Encoder for [`V1NetworkMessage`].
+    #[derive(Debug, Clone)]
+    pub struct V1NetworkMessageEncoder<'e>(
         encoding::Encoder2<
             encoding::Encoder4<
                 encoding::ArrayEncoder<4>,
-                encoding::ArrayEncoder<12>,
+                CommandStringEncoder,
                 encoding::ArrayEncoder<4>,
                 encoding::ArrayEncoder<4>,
             >,
-            NetworkMessageEncoder,
+            NetworkMessageEncoder<'e>,
         >
     );
 }
 
-impl encoding::Encodable for RawNetworkMessage {
-    type Encoder<'e> = RawNetworkMessageEncoder<'e>;
+impl encoding::Encode for V1NetworkMessage {
+    type Encoder<'e> = V1NetworkMessageEncoder<'e>;
 
     fn encoder(&self) -> Self::Encoder<'_> {
-        RawNetworkMessageEncoder::new(encoding::Encoder2::new(
+        V1NetworkMessageEncoder::new(encoding::Encoder2::new(
             encoding::Encoder4::new(
                 encoding::ArrayEncoder::without_length_prefix(self.magic.to_bytes()),
                 self.command().encoder(),
@@ -875,292 +1221,230 @@ impl encoding::Encodable for RawNetworkMessage {
     }
 }
 
-struct NetworkMessageDecoder {
-    command: CommandString,
-    payload_len: usize,
-    buffer: Vec<u8>,
+#[derive(Debug, Clone)]
+enum NetworkMessageDecoder {
+    Version(message_network::VersionMessageDecoder),
+    Addr(AddrPayloadDecoder),
+    Inv(InventoryPayloadDecoder),
+    GetData(InventoryPayloadDecoder),
+    NotFound(InventoryPayloadDecoder),
+    GetBlocks(message_blockdata::GetBlocksMessageDecoder),
+    GetHeaders(message_blockdata::GetHeadersMessageDecoder),
+    Tx(<transaction::Transaction as encoding::Decode>::Decoder),
+    Block(<block::Block as encoding::Decode>::Decoder),
+    Headers(HeadersMessageDecoder),
+    Ping(PingDecoder),
+    Pong(PongDecoder),
+    MerkleBlock(<MerkleBlock as encoding::Decode>::Decoder),
+    FilterLoad(message_bloom::FilterLoadDecoder),
+    FilterAdd(message_bloom::FilterAddDecoder),
+    GetCFilters(message_filter::GetCFiltersDecoder),
+    CFilter(message_filter::CFilterDecoder),
+    GetCFHeaders(message_filter::GetCFHeadersDecoder),
+    CFHeaders(message_filter::CFHeadersDecoder),
+    GetCFCheckpt(message_filter::GetCFCheckptDecoder),
+    CFCheckpt(message_filter::CFCheckptDecoder),
+    SendCmpct(message_compact_blocks::SendCmpctDecoder),
+    CmpctBlock(<bip152::HeaderAndShortIds as encoding::Decode>::Decoder),
+    GetBlockTxn(<bip152::BlockTransactionsRequest as encoding::Decode>::Decoder),
+    BlockTxn(<bip152::BlockTransactions as encoding::Decode>::Decoder),
+    Alert(message_network::AlertDecoder),
+    Reject(message_network::RejectDecoder),
+    FeeFilter(FeeFilterDecoder),
+    AddrV2(AddrV2PayloadDecoder),
+    /// Zero-payload messages: verack, mempool, sendheaders, getaddr, wtxidrelay,
+    /// filterclear, sendaddrv2.
+    Empty(CommandString),
+    /// Unknown message — must buffer since type is unknown at compile time.
+    Unknown {
+        command: CommandString,
+        remaining: usize,
+        buffer: Vec<u8>,
+    },
 }
 
 impl NetworkMessageDecoder {
     fn new(command: CommandString, payload_len: usize) -> Self {
-        Self { command, payload_len, buffer: Vec::new() }
+        use encoding::Decode as _;
+        match command.as_ref() {
+            "version" => Self::Version(message_network::VersionMessage::decoder()),
+            "verack" | "sendheaders" | "mempool" | "getaddr" | "wtxidrelay" | "filterclear"
+            | "sendaddrv2" => Self::Empty(command),
+            "addr" => Self::Addr(AddrPayload::decoder()),
+            "inv" => Self::Inv(InventoryPayload::decoder()),
+            "getdata" => Self::GetData(InventoryPayload::decoder()),
+            "notfound" => Self::NotFound(InventoryPayload::decoder()),
+            "getblocks" => Self::GetBlocks(message_blockdata::GetBlocksMessage::decoder()),
+            "getheaders" => Self::GetHeaders(message_blockdata::GetHeadersMessage::decoder()),
+            "tx" => Self::Tx(transaction::Transaction::decoder()),
+            "block" => Self::Block(block::Block::decoder()),
+            "headers" => Self::Headers(HeadersMessage::decoder()),
+            "ping" => Self::Ping(Ping::decoder()),
+            "pong" => Self::Pong(Pong::decoder()),
+            "merkleblock" => Self::MerkleBlock(MerkleBlock::decoder()),
+            "filterload" => Self::FilterLoad(message_bloom::FilterLoad::decoder()),
+            "filteradd" => Self::FilterAdd(message_bloom::FilterAdd::decoder()),
+            "getcfilters" => Self::GetCFilters(message_filter::GetCFilters::decoder()),
+            "cfilter" => Self::CFilter(message_filter::CFilter::decoder()),
+            "getcfheaders" => Self::GetCFHeaders(message_filter::GetCFHeaders::decoder()),
+            "cfheaders" => Self::CFHeaders(message_filter::CFHeaders::decoder()),
+            "getcfcheckpt" => Self::GetCFCheckpt(message_filter::GetCFCheckpt::decoder()),
+            "cfcheckpt" => Self::CFCheckpt(message_filter::CFCheckpt::decoder()),
+            "sendcmpct" => Self::SendCmpct(message_compact_blocks::SendCmpct::decoder()),
+            "cmpctblock" => Self::CmpctBlock(bip152::HeaderAndShortIds::decoder()),
+            "getblocktxn" => Self::GetBlockTxn(bip152::BlockTransactionsRequest::decoder()),
+            "blocktxn" => Self::BlockTxn(bip152::BlockTransactions::decoder()),
+            "alert" => Self::Alert(message_network::Alert::decoder()),
+            "reject" => Self::Reject(message_network::Reject::decoder()),
+            "feefilter" => Self::FeeFilter(FeeFilter::decoder()),
+            "addrv2" => Self::AddrV2(AddrV2Payload::decoder()),
+            _ => Self::Unknown {
+                command,
+                remaining: payload_len,
+                buffer: Vec::with_capacity(payload_len),
+            },
+        }
     }
 }
 
 impl encoding::Decoder for NetworkMessageDecoder {
     type Output = NetworkMessage;
-    type Error = RawNetworkMessageDecoderError;
+    type Error = V1NetworkMessageDecoderError;
 
+    #[inline]
     fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
-        let remaining = self.payload_len - self.buffer.len();
-        let copy_len = bytes.len().min(remaining);
-
-        self.buffer.extend_from_slice(&bytes[..copy_len]);
-        *bytes = &bytes[copy_len..];
-
-        Ok(self.buffer.len() < self.payload_len)
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn end(self) -> Result<Self::Output, Self::Error> {
-        let payload_bytes = self.buffer;
-
-        // Validate payload length matches actual data.
-        if payload_bytes.len() != self.payload_len {
-            return Err(RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload));
+        let err = V1NetworkMessageDecoderError(V1NetworkMessageDecoderErrorInner::Payload);
+        match self {
+            Self::Version(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Addr(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Inv(d) | Self::GetData(d) | Self::NotFound(d) =>
+                d.push_bytes(bytes).map_err(|_| err),
+            Self::GetBlocks(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::GetHeaders(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Tx(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Block(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Headers(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Ping(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Pong(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::MerkleBlock(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::FilterLoad(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::FilterAdd(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::GetCFilters(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::CFilter(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::GetCFHeaders(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::CFHeaders(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::GetCFCheckpt(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::CFCheckpt(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::SendCmpct(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::CmpctBlock(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::GetBlockTxn(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::BlockTxn(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Alert(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Reject(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::FeeFilter(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::AddrV2(d) => d.push_bytes(bytes).map_err(|_| err),
+            Self::Empty(_) => Ok(false),
+            Self::Unknown { remaining, buffer, .. } => {
+                let copy_len = bytes.len().min(*remaining);
+                let (to_copy, rest) = bytes.split_at(copy_len);
+                buffer.extend_from_slice(to_copy);
+                *bytes = rest;
+                *remaining -= copy_len;
+                Ok(*remaining > 0)
+            }
         }
-
-        // TODO: delegate to internal decoders once migrated to consensus_encoding.
-        let mut mem_d = payload_bytes.as_slice();
-        let payload = match self.command.as_ref() {
-            "version" => NetworkMessage::Version(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "verack" => NetworkMessage::Verack,
-            "addr" => NetworkMessage::Addr(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "inv" => NetworkMessage::Inv(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getdata" => NetworkMessage::GetData(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "notfound" => NetworkMessage::NotFound(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getblocks" => NetworkMessage::GetBlocks(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getheaders" => NetworkMessage::GetHeaders(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "mempool" => NetworkMessage::MemPool,
-            "block" => NetworkMessage::Block(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "headers" => NetworkMessage::Headers(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "sendheaders" => NetworkMessage::SendHeaders,
-            "getaddr" => NetworkMessage::GetAddr,
-            "ping" => NetworkMessage::Ping(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "pong" => NetworkMessage::Pong(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "merkleblock" => NetworkMessage::MerkleBlock(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "filterload" => NetworkMessage::FilterLoad(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "filteradd" => NetworkMessage::FilterAdd(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "filterclear" => NetworkMessage::FilterClear,
-            "getcfilters" => NetworkMessage::GetCFilters(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "cfilter" => NetworkMessage::CFilter(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getcfheaders" => NetworkMessage::GetCFHeaders(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "cfheaders" => NetworkMessage::CFHeaders(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getcfcheckpt" => NetworkMessage::GetCFCheckpt(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "cfcheckpt" => NetworkMessage::CFCheckpt(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "sendcmpct" => NetworkMessage::SendCmpct(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "cmpctblock" => NetworkMessage::CmpctBlock(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "getblocktxn" => NetworkMessage::GetBlockTxn(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "blocktxn" => NetworkMessage::BlockTxn(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "tx" => NetworkMessage::Tx(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "alert" => NetworkMessage::Alert(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "reject" => NetworkMessage::Reject(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "feefilter" => NetworkMessage::FeeFilter(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "wtxidrelay" => NetworkMessage::WtxidRelay,
-            "addrv2" => NetworkMessage::AddrV2(
-                bitcoin::consensus::encode::Decodable::consensus_decode_from_finite_reader(
-                    &mut mem_d,
-                )
-                .map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Payload)
-                })?,
-            ),
-            "sendaddrv2" => NetworkMessage::SendAddrV2,
-            _ => NetworkMessage::Unknown { command: self.command, payload: payload_bytes },
-        };
-
-        Ok(payload)
     }
 
-    fn read_limit(&self) -> usize { self.payload_len - self.buffer.len() }
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let err = V1NetworkMessageDecoderError(V1NetworkMessageDecoderErrorInner::Payload);
+        match self {
+            Self::Version(d) => Ok(NetworkMessage::Version(d.end().map_err(|_| err)?)),
+            Self::Addr(d) => Ok(NetworkMessage::Addr(d.end().map_err(|_| err)?)),
+            Self::Inv(d) => Ok(NetworkMessage::Inv(d.end().map_err(|_| err)?)),
+            Self::GetData(d) => Ok(NetworkMessage::GetData(d.end().map_err(|_| err)?)),
+            Self::NotFound(d) => Ok(NetworkMessage::NotFound(d.end().map_err(|_| err)?)),
+            Self::GetBlocks(d) => Ok(NetworkMessage::GetBlocks(d.end().map_err(|_| err)?)),
+            Self::GetHeaders(d) => Ok(NetworkMessage::GetHeaders(d.end().map_err(|_| err)?)),
+            Self::Tx(d) => Ok(NetworkMessage::Tx(d.end().map_err(|_| err)?)),
+            Self::Block(d) => Ok(NetworkMessage::Block(d.end().map_err(|_| err)?)),
+            Self::Headers(d) => Ok(NetworkMessage::Headers(d.end().map_err(|_| err)?)),
+            Self::Ping(d) => Ok(NetworkMessage::Ping(d.end().map_err(|_| err)?)),
+            Self::Pong(d) => Ok(NetworkMessage::Pong(d.end().map_err(|_| err)?)),
+            Self::MerkleBlock(d) => Ok(NetworkMessage::MerkleBlock(d.end().map_err(|_| err)?)),
+            Self::FilterLoad(d) => Ok(NetworkMessage::FilterLoad(d.end().map_err(|_| err)?)),
+            Self::FilterAdd(d) => Ok(NetworkMessage::FilterAdd(d.end().map_err(|_| err)?)),
+            Self::GetCFilters(d) => Ok(NetworkMessage::GetCFilters(d.end().map_err(|_| err)?)),
+            Self::CFilter(d) => Ok(NetworkMessage::CFilter(d.end().map_err(|_| err)?)),
+            Self::GetCFHeaders(d) => Ok(NetworkMessage::GetCFHeaders(d.end().map_err(|_| err)?)),
+            Self::CFHeaders(d) => Ok(NetworkMessage::CFHeaders(d.end().map_err(|_| err)?)),
+            Self::GetCFCheckpt(d) => Ok(NetworkMessage::GetCFCheckpt(d.end().map_err(|_| err)?)),
+            Self::CFCheckpt(d) => Ok(NetworkMessage::CFCheckpt(d.end().map_err(|_| err)?)),
+            Self::SendCmpct(d) => Ok(NetworkMessage::SendCmpct(d.end().map_err(|_| err)?)),
+            Self::CmpctBlock(d) => Ok(NetworkMessage::CmpctBlock(d.end().map_err(|_| err)?)),
+            Self::GetBlockTxn(d) => Ok(NetworkMessage::GetBlockTxn(d.end().map_err(|_| err)?)),
+            Self::BlockTxn(d) => Ok(NetworkMessage::BlockTxn(d.end().map_err(|_| err)?)),
+            Self::Alert(d) => Ok(NetworkMessage::Alert(d.end().map_err(|_| err)?)),
+            Self::Reject(d) => Ok(NetworkMessage::Reject(d.end().map_err(|_| err)?)),
+            Self::FeeFilter(d) => Ok(NetworkMessage::FeeFilter(d.end().map_err(|_| err)?)),
+            Self::AddrV2(d) => Ok(NetworkMessage::AddrV2(d.end().map_err(|_| err)?)),
+            Self::Empty(cmd) => match cmd.as_ref() {
+                "verack" => Ok(NetworkMessage::Verack),
+                "mempool" => Ok(NetworkMessage::MemPool),
+                "sendheaders" => Ok(NetworkMessage::SendHeaders),
+                "getaddr" => Ok(NetworkMessage::GetAddr),
+                "wtxidrelay" => Ok(NetworkMessage::WtxidRelay),
+                "filterclear" => Ok(NetworkMessage::FilterClear),
+                "sendaddrv2" => Ok(NetworkMessage::SendAddrV2),
+                _ => Err(err),
+            },
+            Self::Unknown { command, buffer, remaining } => {
+                if remaining != 0 {
+                    return Err(err);
+                }
+                Ok(NetworkMessage::Unknown { command, payload: buffer })
+            }
+        }
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize {
+        match self {
+            Self::Version(d) => d.read_limit(),
+            Self::Addr(d) => d.read_limit(),
+            Self::Inv(d) | Self::GetData(d) | Self::NotFound(d) => d.read_limit(),
+            Self::GetBlocks(d) => d.read_limit(),
+            Self::GetHeaders(d) => d.read_limit(),
+            Self::Tx(d) => d.read_limit(),
+            Self::Block(d) => d.read_limit(),
+            Self::Headers(d) => d.read_limit(),
+            Self::Ping(d) => d.read_limit(),
+            Self::Pong(d) => d.read_limit(),
+            Self::MerkleBlock(d) => d.read_limit(),
+            Self::FilterLoad(d) => d.read_limit(),
+            Self::FilterAdd(d) => d.read_limit(),
+            Self::GetCFilters(d) => d.read_limit(),
+            Self::CFilter(d) => d.read_limit(),
+            Self::GetCFHeaders(d) => d.read_limit(),
+            Self::CFHeaders(d) => d.read_limit(),
+            Self::GetCFCheckpt(d) => d.read_limit(),
+            Self::CFCheckpt(d) => d.read_limit(),
+            Self::SendCmpct(d) => d.read_limit(),
+            Self::CmpctBlock(d) => d.read_limit(),
+            Self::GetBlockTxn(d) => d.read_limit(),
+            Self::BlockTxn(d) => d.read_limit(),
+            Self::Alert(d) => d.read_limit(),
+            Self::Reject(d) => d.read_limit(),
+            Self::FeeFilter(d) => d.read_limit(),
+            Self::AddrV2(d) => d.read_limit(),
+            Self::Empty(_) => 0,
+            Self::Unknown { remaining, .. } => *remaining,
+        }
+    }
 }
 
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
 enum DecoderState {
     ReadingHeader {
         header_decoder: encoding::Decoder4<
@@ -1178,24 +1462,25 @@ enum DecoderState {
     },
 }
 
-/// Decoder for [`RawNetworkMessage`].
+/// Decoder for [`V1NetworkMessage`].
 ///
 /// This decoder implements a two-phase decoding process for Bitcoin V1 P2P messages.
 /// It first decodes the fixed-sized header. It then uses the payload length information
 /// to decode the dynamically sized network message.
-pub struct RawNetworkMessageDecoder {
+#[derive(Debug, Clone)]
+pub struct V1NetworkMessageDecoder {
     state: DecoderState,
 }
 
-impl encoding::Decoder for RawNetworkMessageDecoder {
-    type Output = RawNetworkMessage;
-    type Error = RawNetworkMessageDecoderError;
+impl encoding::Decoder for V1NetworkMessageDecoder {
+    type Output = V1NetworkMessage;
+    type Error = V1NetworkMessageDecoderError;
 
     fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
         match &mut self.state {
             DecoderState::ReadingHeader { header_decoder } => {
                 let need_more = header_decoder.push_bytes(bytes).map_err(|_| {
-                    RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Header)
+                    V1NetworkMessageDecoderError(V1NetworkMessageDecoderErrorInner::Header)
                 })?;
 
                 if !need_more {
@@ -1218,13 +1503,13 @@ impl encoding::Decoder for RawNetworkMessageDecoder {
 
                     let (magic_bytes, command, payload_len_bytes, checksum) =
                         header_decoder.end().map_err(|_| {
-                            RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Header)
+                            V1NetworkMessageDecoderError(V1NetworkMessageDecoderErrorInner::Header)
                         })?;
 
                     let payload_len = u32::from_le_bytes(payload_len_bytes) as usize;
                     if payload_len > MAX_MSG_SIZE {
-                        return Err(RawNetworkMessageDecoderError(
-                            RawNetworkMessageDecoderErrorInner::PayloadTooLarge,
+                        return Err(V1NetworkMessageDecoderError(
+                            V1NetworkMessageDecoderErrorInner::PayloadTooLarge,
                         ));
                     }
 
@@ -1250,7 +1535,7 @@ impl encoding::Decoder for RawNetworkMessageDecoder {
     fn end(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             DecoderState::ReadingHeader { .. } =>
-                Err(RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner::Header)),
+                Err(V1NetworkMessageDecoderError(V1NetworkMessageDecoderErrorInner::Header)),
             DecoderState::ReadingPayload {
                 magic_bytes,
                 payload_len_bytes,
@@ -1259,8 +1544,17 @@ impl encoding::Decoder for RawNetworkMessageDecoder {
                 ..
             } => {
                 let payload = payload_decoder.end()?;
+                let (_, expected_checksum) = sha2_checksum(&payload);
+                if checksum != expected_checksum {
+                    return Err(V1NetworkMessageDecoderError(
+                        V1NetworkMessageDecoderErrorInner::InvalidChecksum {
+                            expected: expected_checksum,
+                            actual: checksum,
+                        },
+                    ));
+                }
 
-                Ok(RawNetworkMessage {
+                Ok(V1NetworkMessage {
                     magic: Magic::from_bytes(magic_bytes),
                     payload,
                     payload_len: u32::from_le_bytes(payload_len_bytes),
@@ -1278,11 +1572,11 @@ impl encoding::Decoder for RawNetworkMessageDecoder {
     }
 }
 
-impl encoding::Decodable for RawNetworkMessage {
-    type Decoder = RawNetworkMessageDecoder;
+impl encoding::Decode for V1NetworkMessage {
+    type Decoder = V1NetworkMessageDecoder;
 
     fn decoder() -> Self::Decoder {
-        RawNetworkMessageDecoder {
+        V1NetworkMessageDecoder {
             state: DecoderState::ReadingHeader {
                 header_decoder: encoding::Decoder4::new(
                     encoding::ArrayDecoder::new(),
@@ -1295,82 +1589,104 @@ impl encoding::Decodable for RawNetworkMessage {
     }
 }
 
-/// Error decoding a raw network message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawNetworkMessageDecoderError(RawNetworkMessageDecoderErrorInner);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RawNetworkMessageDecoderErrorInner {
-    /// Error decoding the message header.
-    Header,
-    /// Payload length exceeds maximum allowed message size.
-    PayloadTooLarge,
-    /// Error decoding the message payload.
-    Payload,
+/// Encoder for [`V2NetworkMessage`].
+///
+/// V2 messages encode a 1-byte short ID for optimized message types (IDs 1-28),
+/// or a 0-byte flag followed by a 12-byte command string for non-optimized types.
+#[derive(Clone, Debug)]
+pub enum V2NetworkMessageEncoder<'e> {
+    /// Optimized message with a 1-byte short ID followed by the payload.
+    ShortId(Encoder2<ArrayEncoder<1>, NetworkMessageEncoder<'e>>),
+    /// Non-optimized message with a 0-byte flag, 12-byte command, and payload.
+    FullCommand(
+        Encoder2<ArrayEncoder<1>, Encoder2<CommandStringEncoder, NetworkMessageEncoder<'e>>>,
+    ),
 }
 
-impl fmt::Display for RawNetworkMessageDecoderError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0 {
-            RawNetworkMessageDecoderErrorInner::Header => {
-                write!(f, "error decoding message header")
-            }
-            RawNetworkMessageDecoderErrorInner::PayloadTooLarge => {
-                write!(f, "payload length exceeds maximum allowed message size")
-            }
-            RawNetworkMessageDecoderErrorInner::Payload => {
-                write!(f, "error decoding message payload")
-            }
+impl encoding::Encoder for V2NetworkMessageEncoder<'_> {
+    fn current_chunk(&self) -> &[u8] {
+        match self {
+            Self::ShortId(e) => e.current_chunk(),
+            Self::FullCommand(e) => e.current_chunk(),
+        }
+    }
+
+    fn advance(&mut self) -> bool {
+        match self {
+            Self::ShortId(e) => e.advance(),
+            Self::FullCommand(e) => e.advance(),
         }
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for RawNetworkMessageDecoderError {}
+impl encoding::Encode for V2NetworkMessage {
+    type Encoder<'e> = V2NetworkMessageEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        let (short_id, full_command) = v2_command_byte(&self.payload);
+        let payload_encoder = NetworkMessageEncoder::new(&self.payload);
+
+        match full_command {
+            Some(cmd) => V2NetworkMessageEncoder::FullCommand(Encoder2::new(
+                ArrayEncoder::without_length_prefix([short_id]),
+                Encoder2::new(cmd.encoder(), payload_encoder),
+            )),
+            None => V2NetworkMessageEncoder::ShortId(Encoder2::new(
+                ArrayEncoder::without_length_prefix([short_id]),
+                payload_encoder,
+            )),
+        }
+    }
+}
+
+// Returns the V2 short ID byte and optional full command for a [`NetworkMessage`].
+fn v2_command_byte(payload: &NetworkMessage) -> (u8, Option<CommandString>) {
+    match payload {
+        NetworkMessage::Addr(_) => (1u8, None),
+        NetworkMessage::Block(_) => (2u8, None),
+        NetworkMessage::BlockTxn(_) => (3u8, None),
+        NetworkMessage::CmpctBlock(_) => (4u8, None),
+        NetworkMessage::FeeFilter(_) => (5u8, None),
+        NetworkMessage::FilterAdd(_) => (6u8, None),
+        NetworkMessage::FilterClear => (7u8, None),
+        NetworkMessage::FilterLoad(_) => (8u8, None),
+        NetworkMessage::GetBlocks(_) => (9u8, None),
+        NetworkMessage::GetBlockTxn(_) => (10u8, None),
+        NetworkMessage::GetData(_) => (11u8, None),
+        NetworkMessage::GetHeaders(_) => (12u8, None),
+        NetworkMessage::Headers(_) => (13u8, None),
+        NetworkMessage::Inv(_) => (14u8, None),
+        NetworkMessage::MemPool => (15u8, None),
+        NetworkMessage::MerkleBlock(_) => (16u8, None),
+        NetworkMessage::NotFound(_) => (17u8, None),
+        NetworkMessage::Ping(_) => (18u8, None),
+        NetworkMessage::Pong(_) => (19u8, None),
+        NetworkMessage::SendCmpct(_) => (20u8, None),
+        NetworkMessage::Tx(_) => (21u8, None),
+        NetworkMessage::GetCFilters(_) => (22u8, None),
+        NetworkMessage::CFilter(_) => (23u8, None),
+        NetworkMessage::GetCFHeaders(_) => (24u8, None),
+        NetworkMessage::CFHeaders(_) => (25u8, None),
+        NetworkMessage::GetCFCheckpt(_) => (26u8, None),
+        NetworkMessage::CFCheckpt(_) => (27u8, None),
+        NetworkMessage::AddrV2(_) => (28u8, None),
+        NetworkMessage::Version(_)
+        | NetworkMessage::Verack
+        | NetworkMessage::SendHeaders
+        | NetworkMessage::GetAddr
+        | NetworkMessage::WtxidRelay
+        | NetworkMessage::SendAddrV2
+        | NetworkMessage::Alert(_)
+        | NetworkMessage::Reject(_)
+        | NetworkMessage::Unknown { .. } => (0u8, Some(payload.command())),
+    }
+}
 
 impl Encodable for V2NetworkMessage {
     fn consensus_encode<W: Write + ?Sized>(&self, writer: &mut W) -> Result<usize, io::Error> {
         // A subset of message types are optimized to only use one byte to encode the command.
         // Non-optimized message types use the zero-byte flag and the following twelve bytes to encode the command.
-        let (command_byte, full_command) = match self.payload {
-            NetworkMessage::Addr(_) => (1u8, None),
-            NetworkMessage::Inv(_) => (14u8, None),
-            NetworkMessage::GetData(_) => (11u8, None),
-            NetworkMessage::NotFound(_) => (17u8, None),
-            NetworkMessage::GetBlocks(_) => (9u8, None),
-            NetworkMessage::GetHeaders(_) => (12u8, None),
-            NetworkMessage::MemPool => (15u8, None),
-            NetworkMessage::Tx(_) => (21u8, None),
-            NetworkMessage::Block(_) => (2u8, None),
-            NetworkMessage::Headers(_) => (13u8, None),
-            NetworkMessage::Ping(_) => (18u8, None),
-            NetworkMessage::Pong(_) => (19u8, None),
-            NetworkMessage::MerkleBlock(_) => (16u8, None),
-            NetworkMessage::FilterLoad(_) => (8u8, None),
-            NetworkMessage::FilterAdd(_) => (6u8, None),
-            NetworkMessage::FilterClear => (7u8, None),
-            NetworkMessage::GetCFilters(_) => (22u8, None),
-            NetworkMessage::CFilter(_) => (23u8, None),
-            NetworkMessage::GetCFHeaders(_) => (24u8, None),
-            NetworkMessage::CFHeaders(_) => (25u8, None),
-            NetworkMessage::GetCFCheckpt(_) => (26u8, None),
-            NetworkMessage::CFCheckpt(_) => (27u8, None),
-            NetworkMessage::SendCmpct(_) => (20u8, None),
-            NetworkMessage::CmpctBlock(_) => (4u8, None),
-            NetworkMessage::GetBlockTxn(_) => (10u8, None),
-            NetworkMessage::BlockTxn(_) => (3u8, None),
-            NetworkMessage::FeeFilter(_) => (5u8, None),
-            NetworkMessage::AddrV2(_) => (28u8, None),
-            NetworkMessage::Version(_)
-            | NetworkMessage::Verack
-            | NetworkMessage::SendHeaders
-            | NetworkMessage::GetAddr
-            | NetworkMessage::WtxidRelay
-            | NetworkMessage::SendAddrV2
-            | NetworkMessage::Alert(_)
-            | NetworkMessage::Reject(_)
-            | NetworkMessage::Unknown { .. } => (0u8, Some(self.payload.command())),
-        };
+        let (command_byte, full_command) = v2_command_byte(&self.payload);
 
         let mut len = command_byte.consensus_encode(writer)?;
         if let Some(cmd) = full_command {
@@ -1384,9 +1700,88 @@ impl Encodable for V2NetworkMessage {
     }
 }
 
+/// Network encoded [`Header`](primitives::block::Header) with associated byte for the length of
+/// transactions that follow, which is currently always zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkHeader {
+    /// Block header.
+    pub header: block::Header,
+    /// Length of transaction list.
+    pub length: u8,
+}
+
+impl NetworkHeader {
+    /// Create a new [`NetworkHeader`] from underlying block header.
+    pub const fn from_header(header: block::Header) -> Self { Self { header, length: 0 } }
+}
+
+encoding::encoder_newtype_exact! {
+    /// The encoder type for a [`NetworkHeader`].
+    #[derive(Debug, Clone)]
+    pub struct NetworkHeaderEncoder<'e>(Encoder2<HeaderEncoder<'e>, ArrayEncoder<1>>);
+}
+
+impl encoding::Encode for NetworkHeader {
+    type Encoder<'e> = NetworkHeaderEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        NetworkHeaderEncoder::new(Encoder2::new(
+            self.header.encoder(),
+            ArrayEncoder::without_length_prefix([self.length]),
+        ))
+    }
+}
+
+type NetworkHeaderInnerDecoder = Decoder2<HeaderDecoder, ArrayDecoder<1>>;
+
+/// The decoder type for a [`NetworkHeader`].
+#[derive(Debug, Clone)]
+pub struct NetworkHeaderDecoder(NetworkHeaderInnerDecoder);
+
+impl encoding::Decoder for NetworkHeaderDecoder {
+    type Output = NetworkHeader;
+    type Error = NetworkHeaderDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(NetworkHeaderDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let (header, length) = self.0.end().map_err(NetworkHeaderDecoderError)?;
+        Ok(NetworkHeader { header, length: u8::from_le_bytes(length) })
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for NetworkHeader {
+    type Decoder = NetworkHeaderDecoder;
+
+    fn decoder() -> Self::Decoder {
+        NetworkHeaderDecoder(Decoder2::new(block::Header::decoder(), ArrayDecoder::new()))
+    }
+}
+
+impl Decodable for NetworkHeader {
+    fn consensus_decode<R: BufRead + ?Sized>(reader: &mut R) -> Result<Self, encode::Error> {
+        Ok(Self { header: Decodable::consensus_decode(reader)?, length: reader.read_u8()? })
+    }
+}
+
+impl Encodable for NetworkHeader {
+    fn consensus_encode<W: Write + ?Sized>(&self, writer: &mut W) -> Result<usize, io::Error> {
+        let mut size = self.header.consensus_encode(writer)?;
+        size += self.length.consensus_encode(writer)?;
+        Ok(size)
+    }
+}
+
 /// A list of bitcoin block headers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeadersMessage(pub Vec<block::Header>);
+pub struct HeadersMessage(pub Vec<NetworkHeader>);
 
 impl HeadersMessage {
     /// Does each header point to the previous block hash in the list.
@@ -1394,37 +1789,66 @@ impl HeadersMessage {
         self.0
             .iter()
             .zip(self.0.iter().skip(1))
-            .all(|(first, second)| first.block_hash().eq(&second.prev_blockhash))
+            .all(|(first, second)| first.header.block_hash().eq(&second.header.prev_blockhash))
+    }
+
+    /// Take the message as an iterator of [`Header`](primitives::block::Header).
+    pub fn into_headers(self) -> impl Iterator<Item = block::Header> {
+        self.0.into_iter().map(|network| network.header)
     }
 }
 
-impl Decodable for HeadersMessage {
-    #[inline]
-    fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
-        r: &mut R,
-    ) -> Result<Self, encode::Error> {
-        let len = r.read_compact_size()?;
-        // should be above usual number of items to avoid
-        // allocation
-        let mut ret = Vec::with_capacity(core::cmp::min(1024 * 16, len as usize));
-        for _ in 0..len {
-            ret.push(Decodable::consensus_decode(r)?);
-            if u8::consensus_decode(r)? != 0u8 {
-                return Err(crate::consensus::parse_failed_error(
-                    "Headers message should not contain transactions",
-                ));
-            }
-        }
-        Ok(Self(ret))
-    }
+impl_vec_wrapper!(HeadersMessage, NetworkHeader);
 
-    #[inline]
-    fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, encode::Error> {
-        Self::consensus_decode_from_finite_reader(&mut r.take(MAX_MSG_SIZE.to_u64()))
+encoding::encoder_newtype! {
+    /// The encoder type for a [`HeadersMessage`].
+    #[derive(Debug, Clone)]
+    pub struct HeadersMessageEncoder<'e>(Encoder2<CompactSizeEncoder, SliceEncoder<'e, NetworkHeader>>);
+}
+
+impl encoding::Encode for HeadersMessage {
+    type Encoder<'e> = HeadersMessageEncoder<'e>;
+
+    fn encoder(&self) -> Self::Encoder<'_> {
+        HeadersMessageEncoder::new(Encoder2::new(
+            CompactSizeEncoder::new(self.0.len()),
+            SliceEncoder::without_length_prefix(&self.0),
+        ))
     }
 }
 
-impl Decodable for RawNetworkMessage {
+type HeadersMessageInnerDecoder = VecDecoder<NetworkHeader>;
+
+/// The decoder type for a [`HeadersMessage`].
+#[derive(Debug, Clone)]
+pub struct HeadersMessageDecoder(HeadersMessageInnerDecoder);
+
+impl encoding::Decoder for HeadersMessageDecoder {
+    type Output = HeadersMessage;
+    type Error = HeadersMessageDecoderError;
+
+    #[inline]
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        self.0.push_bytes(bytes).map_err(HeadersMessageDecoderError)
+    }
+
+    #[inline]
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        let headers = self.0.end().map_err(HeadersMessageDecoderError)?;
+        Ok(HeadersMessage(headers))
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.0.read_limit() }
+}
+
+impl encoding::Decode for HeadersMessage {
+    type Decoder = HeadersMessageDecoder;
+
+    fn decoder() -> Self::Decoder { HeadersMessageDecoder(VecDecoder::new()) }
+}
+
+impl Decodable for V1NetworkMessage {
     fn consensus_decode_from_finite_reader<R: BufRead + ?Sized>(
         r: &mut R,
     ) -> Result<Self, encode::Error> {
@@ -1463,10 +1887,12 @@ impl Decodable for RawNetworkMessage {
             ),
             "sendheaders" => NetworkMessage::SendHeaders,
             "getaddr" => NetworkMessage::GetAddr,
-            "ping" =>
-                NetworkMessage::Ping(Decodable::consensus_decode_from_finite_reader(&mut mem_d)?),
-            "pong" =>
-                NetworkMessage::Pong(Decodable::consensus_decode_from_finite_reader(&mut mem_d)?),
+            "ping" => NetworkMessage::Ping(Ping(Decodable::consensus_decode_from_finite_reader(
+                &mut mem_d,
+            )?)),
+            "pong" => NetworkMessage::Pong(Pong(Decodable::consensus_decode_from_finite_reader(
+                &mut mem_d,
+            )?)),
             "merkleblock" => NetworkMessage::MerkleBlock(
                 Decodable::consensus_decode_from_finite_reader(&mut mem_d)?,
             ),
@@ -1574,8 +2000,8 @@ impl Decodable for V2NetworkMessage {
             15u8 => NetworkMessage::MemPool,
             16u8 => NetworkMessage::MerkleBlock(Decodable::consensus_decode_from_finite_reader(r)?),
             17u8 => NetworkMessage::NotFound(Decodable::consensus_decode_from_finite_reader(r)?),
-            18u8 => NetworkMessage::Ping(Decodable::consensus_decode_from_finite_reader(r)?),
-            19u8 => NetworkMessage::Pong(Decodable::consensus_decode_from_finite_reader(r)?),
+            18u8 => NetworkMessage::Ping(Ping(Decodable::consensus_decode_from_finite_reader(r)?)),
+            19u8 => NetworkMessage::Pong(Pong(Decodable::consensus_decode_from_finite_reader(r)?)),
             20u8 => NetworkMessage::SendCmpct(Decodable::consensus_decode_from_finite_reader(r)?),
             21u8 => NetworkMessage::Tx(Decodable::consensus_decode_from_finite_reader(r)?),
             22u8 => NetworkMessage::GetCFilters(Decodable::consensus_decode_from_finite_reader(r)?),
@@ -1601,6 +2027,214 @@ impl Decodable for V2NetworkMessage {
     }
 }
 
+// State machine for decoding a [`V2NetworkMessage`].
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+enum V2NetworkMessageDecoderState {
+    // Decoding the short-id byte, with the command string and payload decoder
+    // waiting.
+    ShortId(encoding::ArrayDecoder<1>),
+    // Decoding the command string with the short-id byte stored, and payload
+    // decoder waiting.
+    CommandString(CommandStringDecoder),
+    // Decoding the payload, with the short-id and command string.
+    Payload(NetworkMessageDecoder),
+    // Decoder has failed and cannot be used again.
+    Errored,
+}
+
+/// Decoder for [`V2NetworkMessage`].
+///
+/// This decoder implements a multi-phase decoding process for Bitcoin V2 P2P messages.
+/// It first decodes the 1-byte short ID. For optimized messages (IDs 1-28), it dispatches
+/// directly to the payload decoder. For non-optimized messages (ID 0), it first reads the
+/// 12-byte command string before dispatching.
+pub struct V2NetworkMessageDecoder {
+    state: V2NetworkMessageDecoderState,
+}
+
+impl V2NetworkMessageDecoder {
+    /// Creates a payload decoder from a short ID (1-28).
+    fn payload_decoder_from_short_id(
+        short_id: u8,
+    ) -> Result<NetworkMessageDecoder, V2NetworkMessageDecoderError> {
+        use encoding::Decode as _;
+
+        let err = V2NetworkMessageDecoderError::Payload(V1NetworkMessageDecoderError(
+            V1NetworkMessageDecoderErrorInner::Payload,
+        ));
+        // Use a large payload_len for the Unknown variant buffer; actual messages use typed decoders.
+        match short_id {
+            1u8 => Ok(NetworkMessageDecoder::Addr(AddrPayload::decoder())),
+            2u8 => Ok(NetworkMessageDecoder::Block(block::Block::decoder())),
+            3u8 => Ok(NetworkMessageDecoder::BlockTxn(bip152::BlockTransactions::decoder())),
+            4u8 => Ok(NetworkMessageDecoder::CmpctBlock(bip152::HeaderAndShortIds::decoder())),
+            5u8 => Ok(NetworkMessageDecoder::FeeFilter(FeeFilter::decoder())),
+            6u8 => Ok(NetworkMessageDecoder::FilterAdd(message_bloom::FilterAdd::decoder())),
+            7u8 => Ok(NetworkMessageDecoder::Empty(
+                CommandString::try_from_static("filterclear").map_err(|_| err)?,
+            )),
+            8u8 => Ok(NetworkMessageDecoder::FilterLoad(message_bloom::FilterLoad::decoder())),
+            9u8 =>
+                Ok(NetworkMessageDecoder::GetBlocks(message_blockdata::GetBlocksMessage::decoder())),
+            10u8 =>
+                Ok(NetworkMessageDecoder::GetBlockTxn(bip152::BlockTransactionsRequest::decoder())),
+            11u8 => Ok(NetworkMessageDecoder::GetData(InventoryPayload::decoder())),
+            12u8 => Ok(NetworkMessageDecoder::GetHeaders(
+                message_blockdata::GetHeadersMessage::decoder(),
+            )),
+            13u8 => Ok(NetworkMessageDecoder::Headers(HeadersMessage::decoder())),
+            14u8 => Ok(NetworkMessageDecoder::Inv(InventoryPayload::decoder())),
+            15u8 => Ok(NetworkMessageDecoder::Empty(
+                CommandString::try_from_static("mempool").map_err(|_| err)?,
+            )),
+            16u8 => Ok(NetworkMessageDecoder::MerkleBlock(MerkleBlock::decoder())),
+            17u8 => Ok(NetworkMessageDecoder::NotFound(InventoryPayload::decoder())),
+            18u8 => Ok(NetworkMessageDecoder::Ping(Ping::decoder())),
+            19u8 => Ok(NetworkMessageDecoder::Pong(Pong::decoder())),
+            20u8 =>
+                Ok(NetworkMessageDecoder::SendCmpct(message_compact_blocks::SendCmpct::decoder())),
+            21u8 => Ok(NetworkMessageDecoder::Tx(transaction::Transaction::decoder())),
+            22u8 => Ok(NetworkMessageDecoder::GetCFilters(message_filter::GetCFilters::decoder())),
+            23u8 => Ok(NetworkMessageDecoder::CFilter(message_filter::CFilter::decoder())),
+            24u8 =>
+                Ok(NetworkMessageDecoder::GetCFHeaders(message_filter::GetCFHeaders::decoder())),
+            25u8 => Ok(NetworkMessageDecoder::CFHeaders(message_filter::CFHeaders::decoder())),
+            26u8 =>
+                Ok(NetworkMessageDecoder::GetCFCheckpt(message_filter::GetCFCheckpt::decoder())),
+            27u8 => Ok(NetworkMessageDecoder::CFCheckpt(message_filter::CFCheckpt::decoder())),
+            28u8 => Ok(NetworkMessageDecoder::AddrV2(AddrV2Payload::decoder())),
+            id => Err(V2NetworkMessageDecoderError::UnknownShortId(id)),
+        }
+    }
+
+    /// Creates a payload decoder from a command string (for short ID == 0).
+    fn payload_decoder_from_command(command: CommandString) -> NetworkMessageDecoder {
+        use encoding::Decode as _;
+
+        match command.as_ref() {
+            "version" => NetworkMessageDecoder::Version(message_network::VersionMessage::decoder()),
+            "verack" | "sendheaders" | "getaddr" | "wtxidrelay" | "sendaddrv2" =>
+                NetworkMessageDecoder::Empty(command),
+            "alert" => NetworkMessageDecoder::Alert(message_network::Alert::decoder()),
+            "reject" => NetworkMessageDecoder::Reject(message_network::Reject::decoder()),
+            _ => NetworkMessageDecoder::Unknown {
+                command,
+                remaining: 0, // no payload length, buffer all bytes until end().
+                buffer: Vec::new(),
+            },
+        }
+    }
+}
+
+impl encoding::Decoder for V2NetworkMessageDecoder {
+    type Output = V2NetworkMessage;
+    type Error = V2NetworkMessageDecoderError;
+
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<bool, Self::Error> {
+        loop {
+            match &mut self.state {
+                V2NetworkMessageDecoderState::ShortId(short_id_decoder) => {
+                    if short_id_decoder
+                        .push_bytes(bytes)
+                        .map_err(|_| V2NetworkMessageDecoderError::ShortId)?
+                    {
+                        return Ok(true);
+                    }
+
+                    match mem::replace(&mut self.state, V2NetworkMessageDecoderState::Errored) {
+                        V2NetworkMessageDecoderState::ShortId(short_id) => {
+                            let short_id_bytes = short_id
+                                .end()
+                                .map_err(|_| V2NetworkMessageDecoderError::ShortId)?;
+                            let id = short_id_bytes[0];
+                            if id == 0 {
+                                // Non-optimized: need to read 12-byte command string next.
+                                self.state = V2NetworkMessageDecoderState::CommandString(
+                                    CommandStringDecoder { inner: encoding::ArrayDecoder::new() },
+                                );
+                            } else {
+                                // Optimized short ID (1-28): skip command, go straight to payload.
+                                let payload_decoder = Self::payload_decoder_from_short_id(id)?;
+                                self.state = V2NetworkMessageDecoderState::Payload(payload_decoder);
+                            }
+                        }
+                        _ => unreachable!("we know we're in First state"),
+                    }
+                }
+                V2NetworkMessageDecoderState::CommandString(command_string_decoder) => {
+                    if command_string_decoder
+                        .push_bytes(bytes)
+                        .map_err(V2NetworkMessageDecoderError::Command)?
+                    {
+                        return Ok(true);
+                    }
+                    match mem::replace(&mut self.state, V2NetworkMessageDecoderState::Errored) {
+                        V2NetworkMessageDecoderState::CommandString(command_string) => {
+                            let command = command_string
+                                .end()
+                                .map_err(V2NetworkMessageDecoderError::Command)?;
+                            let payload_decoder =
+                                Self::payload_decoder_from_command(command.clone());
+                            self.state = V2NetworkMessageDecoderState::Payload(payload_decoder);
+                        }
+                        _ => unreachable!("we know we're in the Second state"),
+                    }
+                }
+                V2NetworkMessageDecoderState::Payload(payload_decoder) => {
+                    return payload_decoder.push_bytes(bytes).map_err(|e| {
+                        self.state = V2NetworkMessageDecoderState::Errored;
+                        V2NetworkMessageDecoderError::Payload(e)
+                    });
+                }
+                V2NetworkMessageDecoderState::Errored => {
+                    panic!("use of failed decoder");
+                }
+            }
+        }
+    }
+
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            V2NetworkMessageDecoderState::ShortId(d) => {
+                d.end().map_err(|_| V2NetworkMessageDecoderError::ShortId)?;
+                unreachable!("incomplete ShortId decoder should error")
+            }
+            V2NetworkMessageDecoderState::CommandString(d) => {
+                d.end().map_err(V2NetworkMessageDecoderError::Command)?;
+                unreachable!("incomplete CommandString decoder should error")
+            }
+            V2NetworkMessageDecoderState::Payload(payload_decoder) => {
+                let payload =
+                    payload_decoder.end().map_err(V2NetworkMessageDecoderError::Payload)?;
+                Ok(V2NetworkMessage { payload })
+            }
+            V2NetworkMessageDecoderState::Errored => panic!("use of failed decoder"),
+        }
+    }
+
+    fn read_limit(&self) -> usize {
+        match &self.state {
+            V2NetworkMessageDecoderState::ShortId(short_id_decoder) =>
+                short_id_decoder.read_limit(),
+            V2NetworkMessageDecoderState::CommandString(command_string_decoder) =>
+                command_string_decoder.read_limit(),
+            V2NetworkMessageDecoderState::Payload(payload_decoder) => payload_decoder.read_limit(),
+            V2NetworkMessageDecoderState::Errored => 0,
+        }
+    }
+}
+
+impl encoding::Decode for V2NetworkMessage {
+    type Decoder = V2NetworkMessageDecoder;
+
+    fn decoder() -> Self::Decoder {
+        V2NetworkMessageDecoder {
+            state: V2NetworkMessageDecoderState::ShortId(encoding::ArrayDecoder::new()),
+        }
+    }
+}
+
 /// Data and a 4-byte checksum.
 #[derive(PartialEq, Eq, Clone, Debug)]
 pub struct CheckedData {
@@ -1611,7 +2245,8 @@ pub struct CheckedData {
 impl CheckedData {
     /// Constructs a new `CheckedData` computing the checksum of given data.
     pub fn new(data: Vec<u8>) -> Self {
-        let checksum = sha2_checksum(&data);
+        let hash = sha256d::hash(data.as_slice()).to_byte_array();
+        let checksum = [hash[0], hash[1], hash[2], hash[3]];
         Self { data, checksum }
     }
 
@@ -1646,7 +2281,8 @@ impl Decodable for CheckedData {
         let checksum = <[u8; 4]>::consensus_decode_from_finite_reader(r)?;
         let opts = ReadBytesFromFiniteReaderOpts { len, chunk_size: encode::MAX_VEC_SIZE };
         let data = read_bytes_from_finite_reader(r, opts)?;
-        let expected_checksum = sha2_checksum(&data);
+        let hash = sha256d::hash(data.as_slice()).to_byte_array();
+        let expected_checksum = [hash[0], hash[1], hash[2], hash[3]];
         if expected_checksum == checksum {
             Ok(Self { data, checksum })
         } else {
@@ -1690,16 +2326,350 @@ fn read_bytes_from_finite_reader<D: Read + ?Sized>(
 }
 
 /// Does a double-SHA256 on `data` and returns the first 4 bytes.
-fn sha2_checksum(data: &[u8]) -> [u8; 4] {
-    let checksum = sha256d::hash(data);
-    let checksum = checksum.to_byte_array();
-    [checksum[0], checksum[1], checksum[2], checksum[3]]
+fn sha2_checksum(data: &impl encoding::Encode) -> (u64, [u8; 4]) {
+    let mut engine = sha256d::HashEngine::new();
+    hashes::encode_to_engine(data, &mut engine);
+    let bytes_hashed = engine.n_bytes_hashed();
+    let hash = engine.finalize();
+    let checksum = hash.to_byte_array();
+    let leading_bytes = [checksum[0], checksum[1], checksum[2], checksum[3]];
+
+    (bytes_hashed, leading_bytes)
+}
+
+/// Error types for network messages.
+pub mod error {
+    use alloc::borrow::Cow;
+    use core::convert::Infallible;
+    use core::fmt;
+
+    use internals::write_err;
+
+    /// Error decoding a [`CommandString`].
+    ///
+    /// [`CommandString`]: super::CommandString
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum CommandStringDecoderError {
+        /// Unexpected end of data.
+        UnexpectedEof(encoding::UnexpectedEofError),
+        /// Command string contains non-ASCII characters.
+        NotAscii,
+    }
+
+    impl fmt::Display for CommandStringDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self {
+                Self::UnexpectedEof(e) => write!(f, "unexpected end of data: {}", e),
+                Self::NotAscii => write!(f, "command string must be ASCII"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for CommandStringDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::UnexpectedEof(e) => Some(e),
+                Self::NotAscii => None,
+            }
+        }
+    }
+
+    /// Error returned when a command string is invalid.
+    ///
+    /// This is currently returned for command strings longer than 12.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct CommandStringError {
+        pub(super) cow: Cow<'static, str>,
+    }
+
+    impl fmt::Display for CommandStringError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(
+                f,
+                "the command string '{}' has length {} which is larger than 12",
+                self.cow,
+                self.cow.len()
+            )
+        }
+    }
+
+    impl std::error::Error for CommandStringError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
+
+    /// An error consensus decoding a [`V1MessageHeader`].
+    ///
+    /// [`V1MessageHeader`]: super::V1MessageHeader
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct V1MessageHeaderDecoderError(
+        pub(super) <super::V1MessageHeaderInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl fmt::Display for V1MessageHeaderDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "message header decoder error"; self.0)
+        }
+    }
+
+    /// An error decoding a [`InventoryPayload`].
+    ///
+    /// [`InventoryPayload`]: super::InventoryPayload
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct InventoryPayloadDecoderError(
+        pub(super) <super::InventoryInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for InventoryPayloadDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for InventoryPayloadDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "inventory payload error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InventoryPayloadDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error decoding a [`AddrPayload`].
+    ///
+    /// [`AddrPayload`]: super::AddrPayload
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AddrPayloadDecoderError(
+        pub(super) <super::AddrPayloadInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for AddrPayloadDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for AddrPayloadDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "addrv1 payload error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for AddrPayloadDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error decoding a [`AddrV2Payload`].
+    ///
+    /// [`AddrV2Payload`]: super::AddrV2Payload
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AddrV2PayloadDecoderError(
+        pub(super) <super::AddrV2PayloadInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for AddrV2PayloadDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for AddrV2PayloadDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "addrv2 payload error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for AddrV2PayloadDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a [`Ping`].
+    ///
+    /// [`Ping`]: super::Ping
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PingDecoderError(pub(super) <encoding::ArrayDecoder<8> as encoding::Decoder>::Error);
+
+    impl From<Infallible> for PingDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for PingDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "ping decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for PingDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error consensus decoding a [`Pong`].
+    ///
+    /// [`Pong`]: super::Pong
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PongDecoderError(pub(super) <encoding::ArrayDecoder<8> as encoding::Decoder>::Error);
+
+    impl From<Infallible> for PongDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for PongDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write_err!(f, "pong decoder error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for PongDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// Error decoding a raw network message.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct V1NetworkMessageDecoderError(pub(super) V1NetworkMessageDecoderErrorInner);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum V1NetworkMessageDecoderErrorInner {
+        /// Error decoding the message header.
+        Header,
+        /// Payload length exceeds maximum allowed message size.
+        PayloadTooLarge,
+        /// Error decoding the message payload.
+        Payload,
+        /// Message checksum did not match the one reported in the message header.
+        InvalidChecksum { expected: [u8; 4], actual: [u8; 4] },
+    }
+
+    impl fmt::Display for V1NetworkMessageDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match self.0 {
+                V1NetworkMessageDecoderErrorInner::Header => {
+                    write!(f, "error decoding message header")
+                }
+                V1NetworkMessageDecoderErrorInner::PayloadTooLarge => {
+                    write!(f, "payload length exceeds maximum allowed message size")
+                }
+                V1NetworkMessageDecoderErrorInner::Payload => {
+                    write!(f, "error decoding message payload")
+                }
+                V1NetworkMessageDecoderErrorInner::InvalidChecksum { expected: ref e, actual: ref a } => write!(
+                    f,
+                    "invalid checksum: expected {:02x}{:02x}{:02x}{:02x}, actual {:02x}{:02x}{:02x}{:02x}",
+                    e[0], e[1], e[2], e[3], a[0], a[1], a[2], a[3],
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for V1NetworkMessageDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self.0 {
+                V1NetworkMessageDecoderErrorInner::Header => None,
+                V1NetworkMessageDecoderErrorInner::PayloadTooLarge => None,
+                V1NetworkMessageDecoderErrorInner::Payload => None,
+                V1NetworkMessageDecoderErrorInner::InvalidChecksum { expected: _, actual: _ } =>
+                    None,
+            }
+        }
+    }
+
+    /// Error decoding a V2 network message.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub enum V2NetworkMessageDecoderError {
+        /// Error decoding the short ID byte.
+        ShortId,
+        /// Error decoding the command string.
+        Command(CommandStringDecoderError),
+        /// Error decoding the message payload.
+        Payload(V1NetworkMessageDecoderError),
+        /// Unknown short ID value.
+        UnknownShortId(u8),
+    }
+
+    impl fmt::Display for V2NetworkMessageDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::ShortId => {
+                    write!(f, "error decoding V2 message short ID")
+                }
+                Self::Command(e) => {
+                    write_err!(f, "error decoding V2 message command string"; e)
+                }
+                Self::Payload(e) => {
+                    write_err!(f, "error decoding V2 message payload"; e)
+                }
+                Self::UnknownShortId(e) => {
+                    write!(f, "unknown V2 message short ID: {e}")
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for V2NetworkMessageDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::ShortId => None,
+                Self::Command(e) => Some(e),
+                Self::Payload(e) => Some(e),
+                Self::UnknownShortId(_) => None,
+            }
+        }
+    }
+
+    /// An error decoding a [`NetworkHeader`] message.
+    ///
+    /// [`NetworkHeader`]: super::NetworkHeader
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct NetworkHeaderDecoderError(
+        pub(super) <super::NetworkHeaderInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for NetworkHeaderDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for NetworkHeaderDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "network header error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for NetworkHeaderDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
+
+    /// An error decoding a [`HeadersMessage`] message.
+    ///
+    /// [`HeadersMessage`]: super::HeadersMessage
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct HeadersMessageDecoderError(
+        pub(super) <super::HeadersMessageInnerDecoder as encoding::Decoder>::Error,
+    );
+
+    impl From<Infallible> for HeadersMessageDecoderError {
+        fn from(never: Infallible) -> Self { match never {} }
+    }
+
+    impl fmt::Display for HeadersMessageDecoderError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write_err!(f, "headersmessage error"; self.0)
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for HeadersMessageDecoderError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.0) }
+    }
 }
 
 #[cfg(feature = "arbitrary")]
 impl<'a> Arbitrary<'a> for AddrPayload {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(Self(Vec::<(u32, Address)>::arbitrary(u)?))
+        Ok(Self(Vec::<AddrV1Message>::arbitrary(u)?))
     }
 }
 
@@ -1721,6 +2691,13 @@ impl<'a> Arbitrary<'a> for InventoryPayload {
 impl<'a> Arbitrary<'a> for CommandString {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self(u.arbitrary::<String>()?.into()))
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for NetworkHeader {
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { header: u.arbitrary()?, length: u.arbitrary()? })
     }
 }
 
@@ -1747,8 +2724,8 @@ impl<'a> Arbitrary<'a> for NetworkMessage {
             11 => Ok(Self::Headers(u.arbitrary()?)),
             12 => Ok(Self::SendHeaders),
             13 => Ok(Self::GetAddr),
-            14 => Ok(Self::Ping(u.arbitrary()?)),
-            15 => Ok(Self::Pong(u.arbitrary()?)),
+            14 => Ok(Self::Ping(Ping(u.arbitrary()?))),
+            15 => Ok(Self::Pong(Pong(u.arbitrary()?))),
             16 => Ok(Self::MerkleBlock(u.arbitrary()?)),
             17 => Ok(Self::FilterLoad(u.arbitrary()?)),
             18 => Ok(Self::FilterAdd(u.arbitrary()?)),
@@ -1775,7 +2752,7 @@ impl<'a> Arbitrary<'a> for NetworkMessage {
 }
 
 #[cfg(feature = "arbitrary")]
-impl<'a> Arbitrary<'a> for RawNetworkMessage {
+impl<'a> Arbitrary<'a> for V1NetworkMessage {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self::new(u.arbitrary()?, u.arbitrary()?))
     }
@@ -1787,16 +2764,15 @@ mod test {
     use alloc::vec;
     use std::net::Ipv4Addr;
 
-    use bitcoin::consensus::encode::{deserialize, deserialize_partial, serialize};
-    use hex_lit::hex;
+    use hex_unstable::hex;
     use primitives::transaction::{Transaction, Txid};
     use primitives::{Block, BlockHash};
     use units::BlockHeight;
 
     use super::*;
-    use crate::address::AddrV2;
+    use crate::address::{AddrV2, Address};
     use crate::bip152::BlockTransactionsRequest;
-    use crate::message_blockdata::{GetBlocksMessage, GetHeadersMessage, Inventory};
+    use crate::message_blockdata::{BlockLocator, GetBlocksMessage, GetHeadersMessage, Inventory};
     use crate::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
     use crate::message_compact_blocks::SendCmpct;
     use crate::message_filter::{
@@ -1811,22 +2787,22 @@ mod test {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn full_round_ser_der_raw_network_message() {
-        let version_msg: VersionMessage = deserialize(&hex!("721101000100000000000000e6e0845300000000010000000000000000000000000000000000ffff0000000000000100000000000000fd87d87eeb4364f22cf54dca59412db7208d47d920cffce83ee8102f5361746f7368693a302e392e39392f2c9f040001")).unwrap();
-        let tx: Transaction = deserialize(&hex!("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000")).unwrap();
-        let block: Block = deserialize(&hex!("00608e2e094d41aecfbcbf8fe70cb60be57516b07db1bafee4c4de5dad760000000000004aec16eab3be95abe9c54e01cf850c14b8c5cad1bc6b2e73e811db5d5998ada404503e66fcff031b4ebd99d701010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3402983a000404503e6604f1f617271083bc3d6600000000000000000007bb1b0a636b706f6f6c0d506f72746c616e642e484f444cffffffff0200f2052a010000001976a9142ce72b25fe97b52638c199acfaa5e3891ddfed5b88ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000")).unwrap();
-        let header: block::Header = deserialize(&hex!("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b")).unwrap();
+        let version_msg: VersionMessage = encoding::decode_from_slice(&hex!("721101000100000000000000e6e0845300000000010000000000000000000000000000000000ffff0000000000000100000000000000fd87d87eeb4364f22cf54dca59412db7208d47d920cffce83ee8102f5361746f7368693a302e392e39392f2c9f040001")).unwrap();
+        let tx: Transaction = encoding::decode_from_slice(&hex!("0100000001a15d57094aa7a21a28cb20b59aab8fc7d1149a3bdbcddba9c622e4f5f6a99ece010000006c493046022100f93bb0e7d8db7bd46e40132d1f8242026e045f03a0efe71bbb8e3f475e970d790221009337cd7f1f929f00cc6ff01f03729b069a7c21b59b1736ddfee5db5946c5da8c0121033b9b137ee87d5a812d6f506efdd37f0affa7ffc310711c06c7f3e097c9447c52ffffffff0100e1f505000000001976a9140389035a9225b3839e2bbf32d826a1e222031fd888ac00000000")).unwrap();
+        let block: Block = encoding::decode_from_slice(&hex!("00608e2e094d41aecfbcbf8fe70cb60be57516b07db1bafee4c4de5dad760000000000004aec16eab3be95abe9c54e01cf850c14b8c5cad1bc6b2e73e811db5d5998ada404503e66fcff031b4ebd99d701010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff3402983a000404503e6604f1f617271083bc3d6600000000000000000007bb1b0a636b706f6f6c0d506f72746c616e642e484f444cffffffff0200f2052a010000001976a9142ce72b25fe97b52638c199acfaa5e3891ddfed5b88ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000")).unwrap();
+        let header: block::Header = encoding::decode_from_slice(&hex!("010000004ddccd549d28f385ab457e98d1b11ce80bfea2c5ab93015ade4973e400000000bf4473e53794beae34e64fccc471dace6ae544180816f89591894e0f417a914cd74d6e49ffff001d323b3a7b")).unwrap();
         let script = &hex!("1976a91431a420903c05a0a7de2de40c9f02ebedbacdc17288ac");
-        let merkle_block: MerkleBlock = deserialize(&hex!("0100000079cda856b143d9db2c1caff01d1aecc8630d30625d10e8b4b8b0000000000000b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f196367291b4d4c86041b8fa45d630100000001b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f19630101")).unwrap();
-        let cmptblock = deserialize(&hex!("00000030d923ad36ff2d955abab07f8a0a6e813bc6e066b973e780c5e36674cad5d1cd1f6e265f2a17a0d35cbe701fe9d06e2c6324cfe135f6233e8b767bfa3fb4479b71115dc562ffff7f2006000000000000000000000000010002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0302ee00ffffffff0100f9029500000000015100000000")).unwrap();
-        let blocktxn = deserialize(&hex!("2e93c0cff39ff605020072d96bc3a8d20b8447e294d08092351c8583e08d9b5a01020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0402dc0000ffffffff0200f90295000000001976a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000")).unwrap();
+        let merkle_block: MerkleBlock = encoding::decode_from_slice(&hex!("0100000079cda856b143d9db2c1caff01d1aecc8630d30625d10e8b4b8b0000000000000b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f196367291b4d4c86041b8fa45d630100000001b50cc069d6a3e33e3ff84a5c41d9d3febe7c770fdcc96b2c3ff60abe184f19630101")).unwrap();
+        let cmptblock = encoding::decode_from_slice(&hex!("00000030d923ad36ff2d955abab07f8a0a6e813bc6e066b973e780c5e36674cad5d1cd1f6e265f2a17a0d35cbe701fe9d06e2c6324cfe135f6233e8b767bfa3fb4479b71115dc562ffff7f2006000000000000000000000000010002000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0302ee00ffffffff0100f9029500000000015100000000")).unwrap();
+        let blocktxn = encoding::decode_from_slice(&hex!("2e93c0cff39ff605020072d96bc3a8d20b8447e294d08092351c8583e08d9b5a01020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff0402dc0000ffffffff0200f90295000000001976a9142b4569203694fc997e13f2c0a1383b9e16c77a0d88ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000")).unwrap();
 
         let msgs = [
             NetworkMessage::Version(version_msg),
             NetworkMessage::Verack,
-            NetworkMessage::Addr(AddrPayload(vec![(
-                45,
-                Address::new(&([123, 255, 000, 100], 833).into(), ServiceFlags::NETWORK),
-            )])),
+            NetworkMessage::Addr(AddrPayload(vec![AddrV1Message {
+                time: 45,
+                address: Address::new(&([123, 255, 000, 100], 833).into(), ServiceFlags::NETWORK),
+            }])),
             NetworkMessage::Inv(InventoryPayload(vec![Inventory::Block(
                 BlockHash::from_byte_array(hash([8u8; 32]).to_byte_array()),
             )])),
@@ -1836,28 +2812,28 @@ mod test {
             NetworkMessage::NotFound(InventoryPayload(vec![Inventory::Error([0u8; 32])])),
             NetworkMessage::GetBlocks(GetBlocksMessage {
                 version: ProtocolVersion::from_nonstandard(70001),
-                locator_hashes: vec![
+                locator_hashes: BlockLocator::from(vec![
                     BlockHash::from_byte_array(hash([1u8; 32]).to_byte_array()),
                     BlockHash::from_byte_array(hash([4u8; 32]).to_byte_array()),
-                ],
+                ]),
                 stop_hash: BlockHash::from_byte_array(hash([5u8; 32]).to_byte_array()),
             }),
             NetworkMessage::GetHeaders(GetHeadersMessage {
                 version: ProtocolVersion::from_nonstandard(70001),
-                locator_hashes: vec![
+                locator_hashes: BlockLocator::from(vec![
                     BlockHash::from_byte_array(hash([10u8; 32]).to_byte_array()),
                     BlockHash::from_byte_array(hash([40u8; 32]).to_byte_array()),
-                ],
+                ]),
                 stop_hash: BlockHash::from_byte_array(hash([50u8; 32]).to_byte_array()),
             }),
             NetworkMessage::MemPool,
             NetworkMessage::Tx(tx),
             NetworkMessage::Block(block),
-            NetworkMessage::Headers(HeadersMessage(vec![header])),
+            NetworkMessage::Headers(HeadersMessage(vec![NetworkHeader { header, length: 0 }])),
             NetworkMessage::SendHeaders,
             NetworkMessage::GetAddr,
-            NetworkMessage::Ping(15),
-            NetworkMessage::Pong(23),
+            NetworkMessage::Ping(Ping(15)),
+            NetworkMessage::Pong(Pong(23)),
             NetworkMessage::MerkleBlock(merkle_block),
             NetworkMessage::FilterLoad(FilterLoad {
                 filter: hex!("03614e9b050000000000000001").to_vec(),
@@ -1934,13 +2910,18 @@ mod test {
         ];
 
         for msg in &msgs {
-            // V1 messages.
-            let raw_msg = RawNetworkMessage::new(Magic::from_bytes([57, 0, 0, 0]), msg.clone());
-            assert_eq!(deserialize::<RawNetworkMessage>(&serialize(&raw_msg)).unwrap(), raw_msg);
+            let raw_msg = V1NetworkMessage::new(Magic::from_bytes([57, 0, 0, 0]), msg.clone());
+            // V1 messages via encoding traits.
+            let encoded = encoding::encode_to_vec(&raw_msg);
+            let decoded = encoding::decode_from_slice::<V1NetworkMessage>(&encoded).unwrap();
+            assert_eq!(decoded, raw_msg);
 
-            // V2 messages.
+            // V2 messages via encoding traits
             let v2_msg = V2NetworkMessage::new(msg.clone());
-            assert_eq!(deserialize::<V2NetworkMessage>(&serialize(&v2_msg)).unwrap(), v2_msg);
+
+            let v2_encoded = encoding::encode_to_vec(&v2_msg);
+            let v2_decoded = encoding::decode_from_slice::<V2NetworkMessage>(&v2_encoded).unwrap();
+            assert_eq!(v2_decoded, v2_msg);
         }
     }
 
@@ -1955,30 +2936,30 @@ mod test {
 
         // Test serializing.
         let cs = CommandString("Andrew".into());
-        assert_eq!(serialize(&cs), [0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(encoding::encode_to_vec(&cs), [0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
 
         // Test deserializing
         let cs: Result<CommandString, _> =
-            deserialize(&[0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
+            encoding::decode_from_slice(&[0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0, 0]);
         assert!(cs.is_ok());
         assert_eq!(cs.as_ref().unwrap().to_string(), "Andrew".to_owned());
         assert_eq!(cs.unwrap(), CommandString::try_from_static("Andrew").unwrap());
 
         // Test that embedded null bytes are preserved while trailing nulls are trimmed
         let cs: Result<CommandString, _> =
-            deserialize(&[0, 0x41u8, 0x6e, 0x64, 0, 0x72, 0x65, 0x77, 0, 0, 0, 0]);
+            encoding::decode_from_slice(&[0, 0x41u8, 0x6e, 0x64, 0, 0x72, 0x65, 0x77, 0, 0, 0, 0]);
         assert!(cs.is_ok());
         assert_eq!(cs.as_ref().unwrap().to_string(), "\0And\0rew".to_owned());
         assert_eq!(cs.unwrap(), CommandString::try_from_static("\0And\0rew").unwrap());
 
         // Invalid CommandString, must be ASCII
-        assert!(deserialize::<CommandString>(&[
+        assert!(encoding::decode_from_slice::<CommandString>(&[
             0, 0x41u8, 0x6e, 0xa4, 0, 0x72, 0x65, 0x77, 0, 0, 0, 0
         ])
         .is_err());
 
         // Invalid CommandString, must be 12 bytes
-        assert!(deserialize::<CommandString>(&[
+        assert!(encoding::decode_from_slice::<CommandString>(&[
             0x41u8, 0x6e, 0x64, 0x72, 0x65, 0x77, 0, 0, 0, 0, 0
         ])
         .is_err());
@@ -1987,7 +2968,7 @@ mod test {
     #[test]
     #[rustfmt::skip]
     fn serialize_verack() {
-        assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Verack)),
+        assert_eq!(encoding::encode_to_vec(&V1NetworkMessage::new(Magic::BITCOIN, NetworkMessage::Verack)),
                        [0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x61,
                         0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
@@ -1996,7 +2977,7 @@ mod test {
     #[test]
     fn serialize_v2_verack() {
         assert_eq!(
-            serialize(&V2NetworkMessage::new(NetworkMessage::Verack)),
+            encoding::encode_to_vec(&V2NetworkMessage::new(NetworkMessage::Verack)),
             [
                 0x00, // Full command encoding flag.
                 0x76, 0x65, 0x72, 0x61, 0x63, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -2005,30 +2986,32 @@ mod test {
     }
 
     #[test]
-    #[rustfmt::skip]
-    fn serialize_ping() {
-        assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::Ping(100))),
-                       [0xf9, 0xbe, 0xb4, 0xd9, 0x70, 0x69, 0x6e, 0x67,
-                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                        0x08, 0x00, 0x00, 0x00, 0x24, 0x67, 0xf1, 0x1d,
-                        0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fn roundtrip_encode_decode_ping() {
+        let ping = Ping(314);
+        let encoded_ping = encoding::encode_to_vec(&ping);
+        let decoded_ping = encoding::decode_from_slice::<Ping>(&encoded_ping).unwrap();
+        assert_eq!(decoded_ping, ping);
     }
 
     #[test]
-    fn serialize_v2_ping() {
-        assert_eq!(
-            serialize(&V2NetworkMessage::new(NetworkMessage::Ping(100))),
-            [
-                0x12, // Ping command short ID
-                0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ]
-        );
+    fn roundtrip_encode_decode_pong() {
+        let pong = Pong(314);
+        let encoded_pong = encoding::encode_to_vec(&pong);
+        let decoded_pong = encoding::decode_from_slice::<Pong>(&encoded_pong).unwrap();
+        assert_eq!(decoded_pong, pong);
+    }
+
+    #[test]
+    fn pong_from_ping_constructors() {
+        let ping = Ping::new(314);
+        let pong = Pong::from_ping(&ping);
+        assert_eq!(pong.0, 314);
     }
 
     #[test]
     #[rustfmt::skip]
     fn serialize_mempool() {
-        assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::MemPool)),
+        assert_eq!(encoding::encode_to_vec(&V1NetworkMessage::new(Magic::BITCOIN, NetworkMessage::MemPool)),
                        [0xf9, 0xbe, 0xb4, 0xd9, 0x6d, 0x65, 0x6d, 0x70,
                         0x6f, 0x6f, 0x6c, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
@@ -2037,7 +3020,7 @@ mod test {
     #[test]
     fn serialize_v2_mempool() {
         assert_eq!(
-            serialize(&V2NetworkMessage::new(NetworkMessage::MemPool)),
+            encoding::encode_to_vec(&V2NetworkMessage::new(NetworkMessage::MemPool)),
             [
                 0x0F, // MemPool command short ID
             ]
@@ -2047,7 +3030,7 @@ mod test {
     #[test]
     #[rustfmt::skip]
     fn serialize_getaddr() {
-        assert_eq!(serialize(&RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr)),
+        assert_eq!(encoding::encode_to_vec(&V1NetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr)),
                        [0xf9, 0xbe, 0xb4, 0xd9, 0x67, 0x65, 0x74, 0x61,
                         0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
                         0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2]);
@@ -2056,7 +3039,7 @@ mod test {
     #[test]
     fn serialize_v2_getaddr() {
         assert_eq!(
-            serialize(&V2NetworkMessage::new(NetworkMessage::GetAddr)),
+            encoding::encode_to_vec(&V2NetworkMessage::new(NetworkMessage::GetAddr)),
             [
                 0x00, // Full command encoding flag.
                 0x67, 0x65, 0x74, 0x61, 0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -2067,21 +3050,21 @@ mod test {
     #[test]
     fn deserialize_getaddr() {
         #[rustfmt::skip]
-        let msg = deserialize(&[
+        let msg = encoding::decode_from_slice(&[
             0xf9, 0xbe, 0xb4, 0xd9, 0x67, 0x65, 0x74, 0x61,
             0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x5d, 0xf6, 0xe0, 0xe2
         ]);
-        let preimage = RawNetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr);
+        let preimage = V1NetworkMessage::new(Magic::BITCOIN, NetworkMessage::GetAddr);
         assert!(msg.is_ok());
-        let msg: RawNetworkMessage = msg.unwrap();
+        let msg: V1NetworkMessage = msg.unwrap();
         assert_eq!(preimage.magic, msg.magic);
         assert_eq!(preimage.payload, msg.payload);
     }
 
     #[test]
     fn deserialize_v2_getaddr() {
-        let msg = deserialize(&[
+        let msg = encoding::decode_from_slice(&[
             0x00, // Full command encoding flag
             0x67, 0x65, 0x74, 0x61, 0x64, 0x64, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
@@ -2095,7 +3078,7 @@ mod test {
     #[test]
     fn deserialize_version() {
         #[rustfmt::skip]
-        let msg = deserialize::<RawNetworkMessage>(&[
+        let msg = encoding::decode_from_slice::<V1NetworkMessage>(&[
             0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73,
             0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x66, 0x00, 0x00, 0x00, 0xbe, 0x61, 0xb8, 0x27,
@@ -2139,7 +3122,7 @@ mod test {
     #[test]
     fn deserialize_v2_version() {
         #[rustfmt::skip]
-        let msg = deserialize::<V2NetworkMessage>(&[
+        let msg = encoding::decode_from_slice::<V2NetworkMessage>(&[
             0x00, // Full command encoding flag
             0x76, 0x65, 0x72, 0x73, 0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, // "version" command
             0x7f, 0x11, 0x01, 0x00, // version: 70015
@@ -2177,7 +3160,7 @@ mod test {
     #[test]
     fn deserialize_partial_message() {
         #[rustfmt::skip]
-        let data = [
+        let data: [u8; 128] = [
             0xf9, 0xbe, 0xb4, 0xd9, 0x76, 0x65, 0x72, 0x73,
             0x69, 0x6f, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x66, 0x00, 0x00, 0x00, 0xbe, 0x61, 0xb8, 0x27,
@@ -2195,11 +3178,11 @@ mod test {
             0x69, 0x3a, 0x30, 0x2e, 0x31, 0x37, 0x2e, 0x31,
             0x2f, 0x93, 0x8c, 0x08, 0x00, 0x01, 0x00, 0x00
         ];
-        let msg = deserialize_partial::<RawNetworkMessage>(&data);
+        let msg = encoding::decode_from_slice_unbounded::<V1NetworkMessage>(&mut data.as_ref());
         assert!(msg.is_ok());
 
-        let (msg, consumed) = msg.unwrap();
-        assert_eq!(consumed, data.to_vec().len() - 2);
+        let msg = msg.unwrap();
+        assert_eq!(encoding::encode_to_vec(&msg).len(), data.to_vec().len() - 2);
         assert_eq!(msg.magic, Magic::BITCOIN);
         if let NetworkMessage::Version(version_msg) = msg.payload {
             assert_eq!(version_msg.version, ProtocolVersion::INVALID_CB_NO_BAN_VERSION);
@@ -2221,30 +3204,49 @@ mod test {
     }
 
     #[test]
-    fn serialize_checkeddata() {
-        let cd = CheckedData::new(vec![1u8, 2, 3, 4, 5]);
-        assert_eq!(serialize(&cd), [5, 0, 0, 0, 162, 107, 175, 90, 1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn deserialize_checkeddata() {
-        let cd: Result<CheckedData, _> =
-            deserialize(&[5u8, 0, 0, 0, 162, 107, 175, 90, 1, 2, 3, 4, 5]);
-        assert_eq!(cd.ok(), Some(CheckedData::new(vec![1u8, 2, 3, 4, 5])));
-    }
-
-    #[test]
     fn headers_message() {
-        let block_900_000 = deserialize::<block::Header>(
+        let block_900_000 = encoding::decode_from_slice::<block::Header>(
             &hex!("00a0ab20247d4d9f582f9750344cdf62c46d81d046be960340960100000000000000000070f96945530651135839d8adc3f40e595118ec74c7ad81a3d17bb022e554fb0c937f4268743702177ad05f92")
         ).unwrap();
-        let block_900_001 = deserialize::<block::Header>(
+        let block_900_001 = encoding::decode_from_slice::<block::Header>(
             &hex!("00e000208a96960d6d1ca4ee4a283fd83da309b8d5d2bfed380501000000000000000000371c9ffd63d75fb36c57d58eb842d23c0e7ec049daf16d94cc38805c346e9d52e880426874370217973dc83b")
         ).unwrap();
-        let block_900_002 = deserialize::<block::Header>(
+        let block_900_002 = encoding::decode_from_slice::<block::Header>(
             &hex!("0400ff3ffc834fac4e1eb2ae41f1f9776e0f8e24a6090603ffa8010000000000000000002efba7e7280aa60f0a650f29e30332d52e11af57bc58cc6e71f343851f016c676182426874370217e3615653")
         ).unwrap();
-        let headers_message = HeadersMessage(vec![block_900_000, block_900_001, block_900_002]);
+        let header_900_000 = NetworkHeader { header: block_900_000, length: 0 };
+        let header_900_001 = NetworkHeader { header: block_900_001, length: 0 };
+        let header_900_002 = NetworkHeader { header: block_900_002, length: 0 };
+        let headers_message = HeadersMessage(vec![header_900_000, header_900_001, header_900_002]);
         assert!(headers_message.is_connected());
+    }
+
+    #[test]
+    fn network_message_decode() {
+        use encoding::Decoder;
+
+        let data = hex!("010101010101");
+
+        let mut decoder =
+            NetworkMessageDecoder::new(CommandString::try_from_static("unknown").unwrap(), 6);
+        let _ = decoder.push_bytes(&mut data.as_slice());
+        let decoded = decoder.end().unwrap();
+
+        let enc = encoding::encode_to_vec(&decoded);
+        assert_eq!(data.as_slice(), enc.as_slice());
+    }
+
+    #[test]
+    fn command_string_encoder() {
+        use encoding::{Encode as _, ExactSizeEncoder as _};
+
+        let cmd = CommandString::try_from_static("version").unwrap();
+        let expected_bytes: [u8; 12] = [b'v', b'e', b'r', b's', b'i', b'o', b'n', 0, 0, 0, 0, 0];
+
+        let mut encoder = cmd.encoder();
+        assert_eq!(encoder.len(), expected_bytes.len());
+
+        let encoded = encoding::drain_to_vec(&mut encoder);
+        assert_eq!(encoded, expected_bytes);
     }
 }

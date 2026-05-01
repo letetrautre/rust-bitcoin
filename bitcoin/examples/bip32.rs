@@ -2,8 +2,7 @@ use std::env;
 
 use bitcoin::address::{Address, KnownHrp};
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv, Xpub};
-use bitcoin::hex::FromHex;
-use bitcoin::{CompressedPublicKey, NetworkKind};
+use bitcoin::{hex, FullPublicKey, NetworkKind};
 
 fn main() {
     // This example derives root xprv from a 32-byte seed,
@@ -23,7 +22,7 @@ fn main() {
     println!("Seed: {seed_hex}");
     println!("Using mainnet network");
 
-    let seed = Vec::from_hex(seed_hex).unwrap();
+    let seed = hex::decode_to_vec(seed_hex).unwrap();
 
     // calculate root key from seed
     let root = Xpriv::new_master(NetworkKind::Main, &seed);
@@ -40,6 +39,6 @@ fn main() {
     // manually creating indexes this time
     let zero = ChildNumber::ZERO_NORMAL;
     let public_key = xpub.derive_xpub([zero, zero]).unwrap().public_key;
-    let address = Address::p2wpkh(CompressedPublicKey::from_secp(public_key), KnownHrp::Mainnet);
+    let address = Address::p2wpkh(FullPublicKey::from_secp(public_key), KnownHrp::Mainnet);
     println!("First receiving address: {address}");
 }

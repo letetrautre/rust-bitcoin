@@ -9,7 +9,7 @@ use io::{BufRead, Write};
 use crate::consensus::encode::{self, Error, ParseError, WriteExt};
 use crate::consensus::{Decodable, Encodable};
 use crate::crypto::ecdsa;
-use crate::crypto::key::SerializedXOnlyPublicKey;
+use crate::crypto::key::{FullPublicKey, SerializedXOnlyPublicKey};
 use crate::taproot::{self, ControlBlock, LeafScript, TaprootMerkleBranch, TAPROOT_ANNEX_PREFIX};
 use crate::{internal_macros, TapScript, WitnessScript};
 
@@ -17,9 +17,9 @@ type BorrowedControlBlock<'a> = ControlBlock<&'a TaprootMerkleBranch, &'a Serial
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
-pub use primitives::witness::{Iter, Witness};
+pub use primitives::witness::{error, Iter, Witness, WitnessDecoder, WitnessEncoder};
 #[doc(no_inline)]
-pub use primitives::witness::UnexpectedEofError;
+pub use primitives::witness::{UnexpectedEofError, WitnessDecoderError};
 
 impl Decodable for Witness {
     fn consensus_decode<R: BufRead + ?Sized>(r: &mut R) -> Result<Self, Error> {
@@ -49,10 +49,25 @@ internal_macros::define_extension_trait! {
         /// serialized public key. Also useful for spending a P2SH-P2WPKH output.
         ///
         /// It is expected that `pubkey` is related to the secret key used to create `signature`.
-        fn p2wpkh(signature: ecdsa::Signature, pubkey: secp256k1::PublicKey) -> Self {
+        fn p2wpkh(signature: ecdsa::Signature, pubkey: FullPublicKey) -> Self {
             let mut witness = Witness::new();
             witness.push(signature.serialize());
-            witness.push(pubkey.serialize());
+            witness.push(pubkey.to_bytes());
+            witness
+        }
+
+        ///Constructs a new witness required to spend a P2WSH output.
+        ///
+        /// The witness will be made up of the satisfaction elements (signatures, preimages, etc.)
+        /// followed by the witness script as the last element. Also useful for spending a
+        /// P2SH-P2WSH output (with the appropriate scriptSig).
+        ///
+        /// The `satisfaction` slice should contain the script satisfaction stack items in the
+        /// order they are pushed onto the stack (e.g., `&[&[][..], &sig1[..], &sig2[..]]` for a
+        /// 2-of-3 multisig).
+        fn p2wsh(satisfaction: &[&[u8]], witness_script: &WitnessScript) -> Self {
+            let mut witness: Witness = satisfaction.iter().collect();
+            witness.push(witness_script.as_bytes());
             witness
         }
 
@@ -237,11 +252,12 @@ mod sealed {
 
 #[cfg(test)]
 mod test {
-    use hex_lit::hex;
+    use alloc::vec::Vec;
+
+    use hex_unstable::{hex, DisplayHex};
 
     use super::*;
     use crate::consensus::{deserialize, encode, serialize};
-    use crate::hex::DisplayHex;
     use crate::sighash::EcdsaSighashType;
     use crate::taproot::LeafVersion;
     use crate::Transaction;
@@ -423,6 +439,24 @@ mod test {
 
         let tx_bytes_back = serialize(&tx);
         assert_eq!(tx_bytes_back, tx_bytes);
+    }
+
+    #[test]
+    fn p2wsh_witness() {
+        let witness_script_bytes = hex!("522103e5529d8eaa3d559903adb2e881eb06c86ac2574ffa503c45f4e942e2a693b33e2102e5f10fcdcdbab211e0af6a481f5532536ec61a5fdbf7183770cf8680fe729d8152ae");
+        let witness_script = WitnessScript::from_bytes(&witness_script_bytes);
+        let sig1 = hex!("304402201234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef02201234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef01");
+        let sig2 = hex!("3044022011111111111111111111111111111111111111111111111111111111111111110220222222222222222222222222222222222222222222222222222222222222222201");
+
+        // 2-of-2 multisig satisfaction: OP_0 bug push, then two sigs
+        let satisfaction: &[&[u8]] = &[&[], &sig1, &sig2];
+        let witness = Witness::p2wsh(satisfaction, witness_script);
+
+        assert_eq!(witness.len(), 4); // empty push + sig1 + sig2 + witness_script
+        assert_eq!(witness[0], *b"");
+        assert_eq!(witness[1], sig1[..]);
+        assert_eq!(witness[2], sig2[..]);
+        assert_eq!(witness[3], *witness_script.as_bytes());
     }
 
     #[test]

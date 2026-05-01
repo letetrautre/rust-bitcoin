@@ -21,6 +21,7 @@ mod safety_boundary {
 
     impl<T: Copy, const CAP: usize> ArrayVec<T, CAP> {
         /// Constructs an empty `ArrayVec`.
+        #[must_use]
         pub const fn new() -> Self { Self { len: 0, data: [MaybeUninit::uninit(); CAP] } }
 
         /// Constructs a new `ArrayVec` initialized with the contents of `slice`.
@@ -174,7 +175,7 @@ impl<T: Copy + fmt::Debug, const CAP: usize> fmt::Debug for ArrayVec<T, CAP> {
 }
 
 impl<T: Copy + core::hash::Hash, const CAP: usize> core::hash::Hash for ArrayVec<T, CAP> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) { core::hash::Hash::hash(&**self, state) }
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) { core::hash::Hash::hash(&**self, state); }
 }
 
 #[cfg(test)]

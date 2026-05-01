@@ -8,17 +8,16 @@
 
 pub mod params;
 
-use core::fmt;
-
 use crate::constants::ChainHash;
 
 #[rustfmt::skip]                // Keep public re-exports separate.
 #[doc(inline)]
 pub use self::params::Params;
-#[doc(no_inline)]
-pub use network::ParseNetworkError;
 #[doc(inline)]
 pub use network::{Network, NetworkKind, TestnetVersion};
+
+#[doc(no_inline)]
+pub use self::error::{ParseNetworkError, UnknownChainHashError};
 
 /// Extension functionality for the [`Network`] type.
 // `define_extension_trait` chokes on the rustdoc example code.
@@ -77,34 +76,45 @@ mod sealed {
     impl Sealed for super::Network {}
 }
 
-/// Error in parsing network from chain hash.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct UnknownChainHashError(ChainHash);
+/// Error types for network operations.
+pub mod error {
+    use core::fmt;
 
-impl fmt::Display for UnknownChainHashError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "unknown chain hash: {}", self.0)
+    use super::{ChainHash, Network, TestnetVersion};
+
+    #[rustfmt::skip]                // Keep public re-exports separate.
+    #[doc(no_inline)]
+    pub use network::ParseNetworkError;
+
+    /// Error in parsing network from chain hash.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct UnknownChainHashError(ChainHash);
+
+    impl fmt::Display for UnknownChainHashError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "unknown chain hash: {}", self.0)
+        }
     }
-}
 
-#[cfg(feature = "std")]
-impl std::error::Error for UnknownChainHashError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
-}
+    #[cfg(feature = "std")]
+    impl std::error::Error for UnknownChainHashError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { None }
+    }
 
-impl TryFrom<ChainHash> for Network {
-    type Error = UnknownChainHashError;
+    impl TryFrom<ChainHash> for Network {
+        type Error = UnknownChainHashError;
 
-    fn try_from(chain_hash: ChainHash) -> Result<Self, Self::Error> {
-        match chain_hash {
-            // Note: any new network entries must be matched against here.
-            ChainHash::BITCOIN => Ok(Self::Bitcoin),
-            ChainHash::TESTNET3 => Ok(Self::Testnet(TestnetVersion::V3)),
-            ChainHash::TESTNET4 => Ok(Self::Testnet(TestnetVersion::V4)),
-            ChainHash::SIGNET => Ok(Self::Signet),
-            ChainHash::REGTEST => Ok(Self::Regtest),
-            _ => Err(UnknownChainHashError(chain_hash)),
+        fn try_from(chain_hash: ChainHash) -> Result<Self, Self::Error> {
+            match chain_hash {
+                // Note: any new network entries must be matched against here.
+                ChainHash::BITCOIN => Ok(Self::Bitcoin),
+                ChainHash::TESTNET3 => Ok(Self::Testnet(TestnetVersion::V3)),
+                ChainHash::TESTNET4 => Ok(Self::Testnet(TestnetVersion::V4)),
+                ChainHash::SIGNET => Ok(Self::Signet),
+                ChainHash::REGTEST => Ok(Self::Regtest),
+                _ => Err(UnknownChainHashError(chain_hash)),
+            }
         }
     }
 }

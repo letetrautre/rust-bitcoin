@@ -20,14 +20,20 @@ mod encapsulate {
     ///
     /// This is an integer newtype representing fee rate. It provides protection
     /// against mixing up the types, conversion functions, and basic formatting.
+    ///
+    /// NOTE: `FeeRate` explicitly does not have any format/display trait implementations, as it
+    /// doesn't have a standard unit for measure. Users are expected to format it on their own by
+    /// extracting values in desired units with `from_sat_per*` functions.
     #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
     pub struct FeeRate(u64);
 
     impl FeeRate {
         /// Constructs a new [`FeeRate`] from satoshis per 1,000,000 virtual bytes.
+        #[inline]
         pub(crate) const fn from_sat_per_mvb(sat_mvb: u64) -> Self { Self(sat_mvb) }
 
         /// Converts to sat/MvB.
+        #[inline]
         pub(crate) const fn to_sat_per_mvb(self) -> u64 { self.0 }
     }
 }
@@ -58,12 +64,14 @@ impl FeeRate {
     pub const DUST: Self = Self::from_sat_per_vb(3);
 
     /// Constructs a new [`FeeRate`] from satoshis per 1000 weight units.
+    #[inline]
     pub const fn from_sat_per_kwu(sat_kwu: u32) -> Self {
         let fee_rate = (const_casts::u32_to_u64(sat_kwu)) * 4_000;
         Self::from_sat_per_mvb(fee_rate)
     }
 
     /// Constructs a new [`FeeRate`] from amount per 1000 weight units.
+    #[inline]
     pub const fn from_per_kwu(rate: Amount) -> NumOpResult<Self> {
         // No `map()` in const context.
         match rate.checked_mul(4_000) {
@@ -73,12 +81,14 @@ impl FeeRate {
     }
 
     /// Constructs a new [`FeeRate`] from satoshis per virtual byte.
+    #[inline]
     pub const fn from_sat_per_vb(sat_vb: u32) -> Self {
         let fee_rate = (const_casts::u32_to_u64(sat_vb)) * 1_000_000;
         Self::from_sat_per_mvb(fee_rate)
     }
 
     /// Constructs a new [`FeeRate`] from amount per virtual byte.
+    #[inline]
     pub const fn from_per_vb(rate: Amount) -> NumOpResult<Self> {
         // No `map()` in const context.
         match rate.checked_mul(1_000_000) {
@@ -88,12 +98,14 @@ impl FeeRate {
     }
 
     /// Constructs a new [`FeeRate`] from satoshis per kilo virtual bytes (1,000 vbytes).
+    #[inline]
     pub const fn from_sat_per_kvb(sat_kvb: u32) -> Self {
         let fee_rate = (const_casts::u32_to_u64(sat_kvb)) * 1_000;
         Self::from_sat_per_mvb(fee_rate)
     }
 
     /// Constructs a new [`FeeRate`] from satoshis per kilo virtual bytes (1,000 vbytes).
+    #[inline]
     pub const fn from_per_kvb(rate: Amount) -> NumOpResult<Self> {
         // No `map()` in const context.
         match rate.checked_mul(1_000) {
@@ -103,26 +115,33 @@ impl FeeRate {
     }
 
     /// Converts to sat/kwu rounding down.
+    #[inline]
     pub const fn to_sat_per_kwu_floor(self) -> u64 { self.to_sat_per_mvb() / 4_000 }
 
     /// Converts to sat/kwu rounding up.
+    #[inline]
     pub const fn to_sat_per_kwu_ceil(self) -> u64 { self.to_sat_per_mvb().div_ceil(4_000) }
 
     /// Converts to sat/vB rounding down.
+    #[inline]
     pub const fn to_sat_per_vb_floor(self) -> u64 { self.to_sat_per_mvb() / 1_000_000 }
 
     /// Converts to sat/vB rounding up.
+    #[inline]
     pub const fn to_sat_per_vb_ceil(self) -> u64 { self.to_sat_per_mvb().div_ceil(1_000_000) }
 
     /// Converts to sat/kvb rounding down.
+    #[inline]
     pub const fn to_sat_per_kvb_floor(self) -> u64 { self.to_sat_per_mvb() / 1_000 }
 
     /// Converts to sat/kvb rounding up.
+    #[inline]
     pub const fn to_sat_per_kvb_ceil(self) -> u64 { self.to_sat_per_mvb().div_ceil(1_000) }
 
     /// Checked multiplication.
     ///
     /// Computes `self * rhs`, returning [`None`] if overflow occurred.
+    #[inline]
     #[must_use]
     pub const fn checked_mul(self, rhs: u64) -> Option<Self> {
         // No `map()` in const context.
@@ -135,6 +154,7 @@ impl FeeRate {
     /// Checked division.
     ///
     /// Computes `self / rhs` returning [`None`] if `rhs == 0`.
+    #[inline]
     #[must_use]
     pub const fn checked_div(self, rhs: u64) -> Option<Self> {
         // No `map()` in const context.
@@ -147,6 +167,7 @@ impl FeeRate {
     /// Checked addition.
     ///
     /// Computes `self + rhs` returning [`None`] in case of overflow.
+    #[inline]
     #[must_use]
     pub const fn checked_add(self, rhs: Self) -> Option<Self> {
         // No `map()` in const context.
@@ -159,6 +180,7 @@ impl FeeRate {
     /// Checked subtraction.
     ///
     /// Computes `self - rhs`, returning [`None`] if overflow occurred.
+    #[inline]
     #[must_use]
     pub const fn checked_sub(self, rhs: Self) -> Option<Self> {
         // No `map()` in const context.
@@ -177,6 +199,7 @@ impl FeeRate {
     /// If the calculation would overflow we saturate to [`Amount::MAX`]. Since such a fee can never
     /// be paid this is meaningful as an error case while still removing the possibility of silently
     /// wrapping.
+    #[inline]
     pub const fn to_fee(self, weight: Weight) -> Amount {
         // No `unwrap_or()` in const context.
         match self.mul_by_weight(weight) {
@@ -242,6 +265,7 @@ crate::internal_macros::impl_add_assign!(FeeRate);
 crate::internal_macros::impl_sub_assign!(FeeRate);
 
 impl core::iter::Sum for FeeRate {
+    #[inline]
     fn sum<I>(iter: I) -> Self
     where
         I: Iterator<Item = Self>,
@@ -251,6 +275,7 @@ impl core::iter::Sum for FeeRate {
 }
 
 impl<'a> core::iter::Sum<&'a Self> for FeeRate {
+    #[inline]
     fn sum<I>(iter: I) -> Self
     where
         I: Iterator<Item = &'a Self>,

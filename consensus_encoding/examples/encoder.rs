@@ -3,7 +3,7 @@
 //! Example of creating an encoder that encodes a slice of encodable objects.
 
 use bitcoin_consensus_encoding as encoding;
-use encoding::{ArrayEncoder, BytesEncoder, CompactSizeEncoder, Encodable, Encoder2, SliceEncoder};
+use encoding::{ArrayEncoder, BytesEncoder, CompactSizeEncoder, Encode, Encoder2, SliceEncoder};
 
 fn main() {
     let v = vec![Inner::new(0xcafe_babe), Inner::new(0xdead_beef)];
@@ -32,7 +32,7 @@ encoding::encoder_newtype! {
     pub struct AdtEncoder<'e>(Encoder2<Encoder2<CompactSizeEncoder, SliceEncoder<'e, Inner>>, BytesEncoder<'e>>);
 }
 
-impl Encodable for Adt {
+impl Encode for Adt {
     type Encoder<'e>
         = AdtEncoder<'e>
     where
@@ -66,7 +66,7 @@ encoding::encoder_newtype_exact! {
     pub struct InnerEncoder<'e>(ArrayEncoder<4>);
 }
 
-impl Encodable for Inner {
+impl Encode for Inner {
     type Encoder<'e> = InnerEncoder<'e>;
     fn encoder(&self) -> Self::Encoder<'_> {
         InnerEncoder::new(ArrayEncoder::without_length_prefix(self.to_array()))

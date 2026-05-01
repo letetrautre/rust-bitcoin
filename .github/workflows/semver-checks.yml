@@ -23,7 +23,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5d458579430fc14a04a08a1e7d3694f545e91ce6 # stable
       - name: "Select stable-version"
         run: |
-          rustup default $(cat ./.github/workflows/stable-version)
+          rustup default $(cat ./stable-version)
       - name: "Install cargo-binstall"
         uses: cargo-bins/cargo-binstall@b3f755e95653da9a2d25b99154edfdbd5b356d0a # v1.15.10
       - name: "Binstall pinned cargo-semver-checks"
@@ -43,7 +43,7 @@ jobs:
           echo "$PR_NUMBER" > ./semver-break
       - name: "Save breaking state"
         if: ${{ hashFiles('semver-break') != '' }}
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: semver-break
           path: semver-break
@@ -65,7 +65,7 @@ jobs:
         uses: dtolnay/rust-toolchain@5d458579430fc14a04a08a1e7d3694f545e91ce6 # stable
       - name: "Select stable-version"
         run: |
-          rustup default $(cat ./.github/workflows/stable-version)
+          rustup default $(cat ./stable-version)
       - name: "Install cargo-binstall"
         uses: cargo-bins/cargo-binstall@b3f755e95653da9a2d25b99154edfdbd5b356d0a # v1.15.10
       - name: "Binstall pinned cargo-semver-checks"
