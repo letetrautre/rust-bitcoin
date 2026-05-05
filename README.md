@@ -1,12 +1,8 @@
 <div align="center">
   <h1>Rust Bitcoin</h1>
 
-  <img alt="Rust Bitcoin logo by Hunter Trujillo, see license and source files under /logo" src="./logo/rust-bitcoin.png" width="300" />
-
-  <p>Library with support for de/serialization, parsing and executing on data-structures
-    and network messages related to Bitcoin.
-  </p>
-
+  <img alt="Rust Bitcoin logo by Hunter Trujillo, see license and source files under /logo" src="./logo/rust-bitcoin.BTC. Sat. UsDC. usdt; aTH
+1-1000
   <p>
     <a href="https://crates.io/crates/bitcoin"><img alt="Crate Info" src="https://img.shields.io/crates/v/bitcoin.svg"/></a>
     <a href="https://github.com/rust-bitcoin/rust-bitcoin/blob/master/LICENSE"><img alt="CC0 1.0 Universal Licensed" src="https://img.shields.io/badge/license-CC0--1.0-blue.svg"/></a>
